@@ -1,0 +1,311 @@
+//@version=6
+indicator("支撐阻力", shorttitle = "支撐阻力", overlay = true, max_lines_count = 100, max_boxes_count = 100, max_labels_count = 500)
+
+// ════════════════════════════════════════════════════════════════════
+//  支撐阻力 —— 前高前低 + 成交量確認 + 互換原理
+//  • 支撐 / 強支撐：目前價格下方的價位
+//  • 壓力 / 強壓力：目前價格上方的價位
+//  • 收盤價突破後，壓力轉為支撐；跌破後，支撐轉為壓力（名稱直接改寫）
+//  • 同一價位被前高 / 前低觸碰達設定次數 → 名稱加「強」
+//  • 訊號：帶量突破、帶量跌破、支撐反彈、壓力回落、假突破、假跌破
+//  • 不綁定商品，任何幣種、任何週期皆可使用
+// ════════════════════════════════════════════════════════════════════
+
+// ───────────────────────────── 輸入 ─────────────────────────────
+const string G_LV  = "① 支撐 / 壓力 判定"
+const string G_VOL = "② 成交量"
+const string G_SIG = "③ 訊號"
+const string G_STY = "④ 外觀"
+
+int    pivotLen    = input.int(10, "前高 / 前低 左右K棒數", minval = 2, group = G_LV, tooltip = "轉折高點(低點)左右兩側各需幾根K棒比它低(高)。數字越大，價位越少、越重要。")
+int    strongTouch = input.int(3, "強支撐 / 強壓力 觸碰次數", minval = 2, group = G_LV, tooltip = "同一價位被前高 / 前低觸碰達此次數，名稱加上「強」。")
+float  mergeMult   = input.float(1.0, "同一價位合併距離 (ATR 倍數)", minval = 0.1, step = 0.1, group = G_LV, tooltip = "新的前高 / 前低與既有價位距離小於 ATR × 此值，視為同一價位，觸碰次數 +1。")
+float  zoneMult    = input.float(0.3, "區間寬度 (ATR 倍數)", minval = 0.0, step = 0.05, group = G_LV, tooltip = "收盤價超出區間才算有效突破 / 跌破；影線碰到區間才算回測。")
+int    perSide     = input.int(4, "上下各顯示幾條", minval = 1, maxval = 15, group = G_LV)
+int    atrLen      = input.int(14, "ATR 週期", minval = 1, group = G_LV)
+string resWord     = input.string("壓力", "上方價位名稱", options = ["壓力", "阻力"], group = G_LV)
+
+int    volLen      = input.int(20, "均量週期", minval = 1, group = G_VOL)
+float  volMult     = input.float(1.5, "帶量倍數", minval = 1.0, step = 0.1, group = G_VOL, tooltip = "突破K棒的成交量 ≥ 均量 × 此倍數，才算「帶量」。")
+
+bool   showBreak   = input.bool(true, "帶量突破 / 帶量跌破", group = G_SIG)
+bool   showBounce  = input.bool(true, "支撐反彈 / 壓力回落", group = G_SIG)
+bool   showFake    = input.bool(true, "假突破 / 假跌破", group = G_SIG)
+int    fakeBars    = input.int(3, "假突破判定K棒數", minval = 1, group = G_SIG, tooltip = "帶量突破後 N 根K棒內收盤又跌回線下 → 假突破；帶量跌破後 N 根內收盤又站回線上 → 假跌破。")
+int    coolDown    = input.int(5, "反彈 / 回落 訊號最少間隔K棒", minval = 1, group = G_SIG)
+bool   confirmOnly = input.bool(true, "K棒收盤後才標示訊號", group = G_SIG, tooltip = "依收盤價判定，避免盤中訊號出現又消失。")
+
+color  supCol      = input.color(#089981, "支撐", inline = "c1", group = G_STY)
+color  resCol      = input.color(#f23645, "壓力", inline = "c1", group = G_STY)
+color  bullCol     = input.color(#00c853, "多方訊號", inline = "c2", group = G_STY)
+color  bearCol     = input.color(#ff1744, "空方訊號", inline = "c2", group = G_STY)
+string lvSizeIn    = input.string("大", "價位文字大小", options = ["小", "中", "大", "特大"], group = G_STY)
+string sigSizeIn   = input.string("大", "訊號文字大小", options = ["小", "中", "大", "特大"], group = G_STY)
+bool   showPrice   = input.bool(true, "價位標籤顯示價格", group = G_STY)
+bool   showZone    = input.bool(true, "顯示區間底色", group = G_STY)
+int    lblOffset   = input.int(5, "價位標籤右移K棒數", minval = 0, maxval = 100, group = G_STY)
+
+// ─────────────────────────── 型別與函式 ───────────────────────────
+type Level
+    float price
+    int   touches  = 1
+    bool  isRes    = false
+    int   startBar
+    int   lastBar
+    int   breakDir = 0    // 1 = 剛帶量突破，-1 = 剛帶量跌破（用於判定假突破 / 假跌破）
+    int   breakBar = 0
+
+toSize(string s) =>
+    switch s
+        "小" => size.small
+        "中" => size.normal
+        "大" => size.large
+        => size.huge
+
+// 依位置與觸碰次數命名：強支撐 / 支撐 / 強壓力 / 壓力
+lvName(bool isRes, int touches) =>
+    string base = isRes ? resWord : "支撐"
+    touches >= strongTouch ? "強" + base : base
+
+addLine(string a, string b) =>
+    a == "" ? b : a + "\n" + b
+
+fmt(float p) =>
+    str.tostring(p, format.mintick)
+
+// ─────────────────────────── 基礎數值 ───────────────────────────
+float  atr     = ta.atr(atrLen)
+float  vol     = nz(volume)
+float  volMA   = ta.sma(vol, volLen)
+bool   hasVol  = not na(volMA) and volMA > 0
+bool   volOK   = not hasVol or vol >= volMA * volMult
+string volTxt  = hasVol ? "（量比 " + str.tostring(vol / volMA, "0.0") + " 倍）" : ""
+float  z       = nz(atr) * zoneMult / 2
+bool   canSig  = not confirmOnly or barstate.isconfirmed
+
+// 實體突破：實體至少佔整根K棒一半（排除長影線的假動作）
+float  rng       = high - low
+bool   bullBody  = close > open and close - open >= rng * 0.5
+bool   bearBody  = close < open and open - close >= rng * 0.5
+
+// 止跌 / 止漲 K棒型態
+float  lowerWick = math.min(open, close) - low
+float  upperWick = high - math.max(open, close)
+bool   longLower = rng > 0 and lowerWick >= rng * 0.5
+bool   longUpper = rng > 0 and upperWick >= rng * 0.5
+bool   bullEng   = close > open and close[1] < open[1] and close >= open[1] and open <= close[1]
+bool   bearEng   = close < open and close[1] > open[1] and close <= open[1] and open >= close[1]
+bool   dryBull   = hasVol and vol < volMA and close > open and low >= low[1]
+bool   dryBear   = hasVol and vol < volMA and close < open and high <= high[1]
+string bullWhy   = longLower ? "長下影線" : bullEng ? "紅K吞噬" : dryBull ? "量縮止穩" : ""
+string bearWhy   = longUpper ? "長上影線" : bearEng ? "黑K吞噬" : dryBear ? "量縮止漲" : ""
+
+// ─────────────────────────── 價位追蹤 ───────────────────────────
+const int MAX_LEVELS = 40
+var array<Level> levels = array.new<Level>()
+var int lastBounce = -1000000
+var int lastReject = -1000000
+
+bool   sigBreakUp = false
+bool   sigBreakDn = false
+bool   sigBounce  = false
+bool   sigReject  = false
+bool   sigFakeUp  = false   // 假突破（偏空）
+bool   sigFakeDn  = false   // 假跌破（偏多）
+string tipBreakUp = ""
+string tipBreakDn = ""
+string tipBounce  = ""
+string tipReject  = ""
+string tipFakeUp  = ""
+string tipFakeDn  = ""
+bool   bounceReady = bar_index - lastBounce > coolDown
+bool   rejectReady = bar_index - lastReject > coolDown
+
+if not na(atr)
+    for lv in levels
+        float top  = lv.price + z
+        float bot  = lv.price - z
+        bool  done = false
+
+        // ① 假突破 / 假跌破：帶量突破(跌破)後 N 根K棒內，收盤又回到線的另一側
+        if lv.breakDir != 0
+            int age = bar_index - lv.breakBar
+            if age > fakeBars
+                lv.breakDir := 0
+            else if age > 0 and lv.breakDir == 1 and close < lv.price
+                lv.breakDir := 0
+                lv.isRes    := true
+                done        := true
+                if canSig
+                    sigFakeUp := true
+                    tipFakeUp := addLine(tipFakeUp, "假突破：收盤跌回 " + fmt(lv.price) + " 之下")
+            else if age > 0 and lv.breakDir == -1 and close > lv.price
+                lv.breakDir := 0
+                lv.isRes    := false
+                done        := true
+                if canSig
+                    sigFakeDn := true
+                    tipFakeDn := addLine(tipFakeDn, "假跌破：收盤站回 " + fmt(lv.price) + " 之上")
+
+        if not done
+            // ② 收盤價超出區間 → 角色互換；帶量 + 實體K棒才標示訊號
+            if lv.isRes and close > top
+                string nm = lvName(true, lv.touches)
+                lv.isRes := false
+                if volOK and bullBody
+                    lv.breakDir := 1
+                    lv.breakBar := bar_index
+                    if canSig
+                        sigBreakUp := true
+                        tipBreakUp := addLine(tipBreakUp, "帶量突破 " + nm + " " + fmt(lv.price) + volTxt + " → 轉為支撐")
+            else if not lv.isRes and close < bot
+                string nm = lvName(false, lv.touches)
+                lv.isRes := true
+                if volOK and bearBody
+                    lv.breakDir := -1
+                    lv.breakBar := bar_index
+                    if canSig
+                        sigBreakDn := true
+                        tipBreakDn := addLine(tipBreakDn, "帶量跌破 " + nm + " " + fmt(lv.price) + volTxt + " → 轉為" + resWord)
+            // ③ 由上方回檔到支撐區並出現止跌K棒 / 由下方反彈到壓力區並出現止漲K棒
+            //    （前 2~3 根K棒尚未碰到區間，代表是「回測」而不是在區間內盤整）
+            else if not lv.isRes and low <= top and close > lv.price and bullWhy != "" and bounceReady and math.min(low[2], low[3]) > top
+                if canSig
+                    sigBounce := true
+                    tipBounce := addLine(tipBounce, "回測 " + lvName(false, lv.touches) + " " + fmt(lv.price) + " 止跌（" + bullWhy + "）")
+            else if lv.isRes and high >= bot and close < lv.price and bearWhy != "" and rejectReady and math.max(high[2], high[3]) < bot
+                if canSig
+                    sigReject := true
+                    tipReject := addLine(tipReject, "測試 " + lvName(true, lv.touches) + " " + fmt(lv.price) + " 受阻（" + bearWhy + "）")
+
+if sigBounce
+    lastBounce := bar_index
+if sigReject
+    lastReject := bar_index
+
+// 新的前高 / 前低：靠近既有價位就合併（觸碰 +1），否則新增
+addLevel(float p, int pBar) =>
+    int   idx  = -1
+    float best = atr * mergeMult
+    for [i, lv] in levels
+        float d = math.abs(lv.price - p)
+        if d <= best
+            best := d
+            idx  := i
+    if idx >= 0
+        Level hit = levels.get(idx)
+        hit.price   := (hit.price * hit.touches + p) / (hit.touches + 1)
+        hit.touches := hit.touches + 1
+        hit.lastBar := pBar
+    else
+        levels.push(Level.new(price = p, isRes = close < p, startBar = pBar, lastBar = pBar))
+        if levels.size() > MAX_LEVELS
+            int old = 0
+            for i = 1 to levels.size() - 1
+                if levels.get(i).lastBar < levels.get(old).lastBar
+                    old := i
+            levels.remove(old)
+    idx
+
+float ph = ta.pivothigh(high, pivotLen, pivotLen)
+float pl = ta.pivotlow(low, pivotLen, pivotLen)
+
+if not na(atr)
+    if not na(ph)
+        addLevel(ph, bar_index - pivotLen)
+    if not na(pl)
+        addLevel(pl, bar_index - pivotLen)
+
+// ─────────────────────────── 畫支撐 / 壓力 ───────────────────────────
+var array<line>  lvLines  = array.new<line>()
+var array<box>   lvBoxes  = array.new<box>()
+var array<label> lvLabels = array.new<label>()
+
+drawLevel(Level lv, string lblSize) =>
+    bool   strong = lv.touches >= strongTouch
+    color  c      = lv.isRes ? resCol : supCol
+    int    x1     = math.max(lv.startBar, bar_index - 4900)
+    int    x2     = bar_index + lblOffset
+    string txt    = lvName(lv.isRes, lv.touches) + (showPrice ? "  " + fmt(lv.price) : "")
+    string tip    = "觸碰次數：" + str.tostring(lv.touches) + "\n區間：" + fmt(lv.price - z) + " ~ " + fmt(lv.price + z)
+    lvLines.push(line.new(x1, lv.price, x2, lv.price, color = c, width = strong ? 3 : 2, style = strong ? line.style_solid : line.style_dashed))
+    if showZone and z > 0
+        lvBoxes.push(box.new(x1, lv.price + z, x2, lv.price - z, border_color = color.new(c, 100), border_width = 0, bgcolor = color.new(c, strong ? 75 : 88)))
+    lvLabels.push(label.new(x2, lv.price, txt, color = strong ? c : color.new(c, 20), style = label.style_label_left, textcolor = color.white, size = lblSize, tooltip = tip, text_formatting = text.format_bold))
+    strong
+
+// 只在最後一根K棒重畫：上下各取離現價最近的 N 條
+if barstate.islast
+    for l in lvLines
+        l.delete()
+    for b in lvBoxes
+        b.delete()
+    for lb in lvLabels
+        lb.delete()
+    lvLines.clear()
+    lvBoxes.clear()
+    lvLabels.clear()
+
+    string       lvSize = toSize(lvSizeIn)
+    array<Level> sups   = array.new<Level>()
+    array<float> supD   = array.new<float>()
+    array<Level> ress   = array.new<Level>()
+    array<float> resD   = array.new<float>()
+    for lv in levels
+        float d = math.abs(close - lv.price)
+        if lv.isRes
+            ress.push(lv)
+            resD.push(d)
+        else
+            sups.push(lv)
+            supD.push(d)
+    if sups.size() > 0
+        array<int> near = supD.sort_indices(order.ascending)
+        for k = 0 to math.min(perSide, sups.size()) - 1
+            drawLevel(sups.get(near.get(k)), lvSize)
+    if ress.size() > 0
+        array<int> near = resD.sort_indices(order.ascending)
+        for k = 0 to math.min(perSide, ress.size()) - 1
+            drawLevel(ress.get(near.get(k)), lvSize)
+
+// ─────────────────────────── 訊號箭頭 ───────────────────────────
+string sigSize = toSize(sigSizeIn)
+
+string bullTxt = ""
+string bullTip = ""
+if showBreak and sigBreakUp
+    bullTxt := addLine(bullTxt, "▲ 帶量突破")
+    bullTip := addLine(bullTip, tipBreakUp)
+if showBounce and sigBounce
+    bullTxt := addLine(bullTxt, "▲ 支撐反彈")
+    bullTip := addLine(bullTip, tipBounce)
+if showFake and sigFakeDn
+    bullTxt := addLine(bullTxt, "▲ 假跌破")
+    bullTip := addLine(bullTip, tipFakeDn)
+if bullTxt != ""
+    label.new(bar_index, low, bullTxt, yloc = yloc.belowbar, color = bullCol, style = label.style_label_up, textcolor = color.white, size = sigSize, tooltip = bullTip, text_formatting = text.format_bold)
+
+string bearTxt = ""
+string bearTip = ""
+if showBreak and sigBreakDn
+    bearTxt := addLine(bearTxt, "▼ 帶量跌破")
+    bearTip := addLine(bearTip, tipBreakDn)
+if showBounce and sigReject
+    bearTxt := addLine(bearTxt, "▼ " + resWord + "回落")
+    bearTip := addLine(bearTip, tipReject)
+if showFake and sigFakeUp
+    bearTxt := addLine(bearTxt, "▼ 假突破")
+    bearTip := addLine(bearTip, tipFakeUp)
+if bearTxt != ""
+    label.new(bar_index, high, bearTxt, yloc = yloc.abovebar, color = bearCol, style = label.style_label_down, textcolor = color.white, size = sigSize, tooltip = bearTip, text_formatting = text.format_bold)
+
+// 量比顯示在資料視窗
+plotchar(hasVol ? vol / volMA : na, "量比", "量", location.top, display = display.data_window)
+
+// ─────────────────────────── 警報 ───────────────────────────
+alertcondition(sigBreakUp, "帶量突破", "{{ticker}} {{interval}}：帶量突破，收盤 {{close}}")
+alertcondition(sigBreakDn, "帶量跌破", "{{ticker}} {{interval}}：帶量跌破，收盤 {{close}}")
+alertcondition(sigBounce,  "支撐反彈", "{{ticker}} {{interval}}：支撐反彈，收盤 {{close}}")
+alertcondition(sigReject,  "壓力回落", "{{ticker}} {{interval}}：壓力回落，收盤 {{close}}")
+alertcondition(sigFakeUp,  "假突破",   "{{ticker}} {{interval}}：假突破，收盤 {{close}}")
+alertcondition(sigFakeDn,  "假跌破",   "{{ticker}} {{interval}}：假跌破，收盤 {{close}}")
