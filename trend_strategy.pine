@@ -1,0 +1,419 @@
+//@version=6
+strategy("趨勢策略", shorttitle = "趨勢策略", overlay = true, initial_capital = 10000, currency = currency.USDT, commission_type = strategy.commission.percent, commission_value = 0.05, slippage = 2, pyramiding = 0, margin_long = 10, margin_short = 10)
+
+// ════════════════════════════════════════════════════════════════════
+//  趨勢策略 —— trend_signals.pine 的回測版（同一套進出場規則）
+//  • 初始資金 10000 USDT，手續費每邊 0.05%，滑價 2 tick
+//  • 訊號在K棒收盤確認，下一根K棒開盤以市價進場
+//  • 每筆風險 = 權益 × 風險%，倉位 = 風險金額 ÷ 停損距離，槓桿超過上限就縮倉
+//  • 保證金比例設 10%（回測最多允許 10 倍），實際槓桿由「槓桿上限」輸入控制（預設 5 倍）
+//  • 停利 1 分批出場，剩餘部位用停利 2 / 停損 / ATR 移動停損出場
+//  • 同一天連虧達設定筆數即停止進場
+//  • 支撐壓力判定沿用 support_resistance.pine；高週期資料只用已收盤K棒（lookahead 關閉）
+// ════════════════════════════════════════════════════════════════════
+
+// ───────────────────────────── 輸入 ─────────────────────────────
+const string G_LT  = "① 長線趨勢（週線 / 日線）"
+const string G_MT  = "② 4 小時趨勢"
+const string G_IN  = "③ 短線進場條件"
+const string G_RK  = "④ 停損 / 停利 / 倉位"
+const string G_LV  = "⑤ 支撐 / 壓力（沿用 support_resistance）"
+const string G_STY = "⑥ 外觀"
+
+const string EX_FIX   = "固定 R 倍數"
+const string EX_TRAIL = "ATR 移動停損"
+const string EX_BOTH  = "兩者皆用（先到先出）"
+
+string tfW         = input.timeframe("W", "週線週期", group = G_LT)
+int    wEmaLen     = input.int(50, "週線 EMA 長度", minval = 1, group = G_LT)
+int    wSlopeBars  = input.int(4, "週線 EMA 斜率：與幾週前比較", minval = 1, group = G_LT)
+int    wRsiLen     = input.int(14, "週線 RSI 長度", minval = 1, group = G_LT)
+float  wRsiLvl     = input.float(50.0, "週線 RSI 多空分界", minval = 0, maxval = 100, group = G_LT)
+string tfD         = input.timeframe("D", "日線週期", group = G_LT)
+int    dFastLen    = input.int(50, "日線 EMA 快線", minval = 1, inline = "d", group = G_LT)
+int    dSlowLen    = input.int(200, "慢線", minval = 1, inline = "d", group = G_LT)
+int    bullNeed    = input.int(3, "偏多：成立條件數 ≥", minval = 1, maxval = 4, group = G_LT, tooltip = "4 個條件：週線收盤 > 週線 EMA、週線 EMA 比 N 週前高、日線 EMA 快線 > 慢線、週線 RSI > 分界。")
+int    bearMax     = input.int(1, "偏空：成立條件數 ≤", minval = 0, maxval = 3, group = G_LT, tooltip = "介於偏多與偏空之間 = 中性。高週期資料不足時也視為中性。")
+
+string tfH         = input.timeframe("240", "4 小時週期", group = G_MT)
+int    hFastLen    = input.int(50, "4 小時 EMA 快線", minval = 1, inline = "h", group = G_MT)
+int    hSlowLen    = input.int(200, "慢線", minval = 1, inline = "h", group = G_MT)
+int    hAdxLen     = input.int(14, "4 小時 ADX 長度", minval = 1, group = G_MT)
+float  hAdxClear   = input.float(25.0, "長線中性時，4 小時 ADX 需大於", minval = 0, group = G_MT, tooltip = "長線中性時，只在 4 小時趨勢很明確（ADX 高於此值）時才出訊號。")
+
+int    emaLen      = input.int(21, "回檔 EMA 長度", minval = 1, group = G_IN)
+float  pbAtr       = input.float(0.5, "回檔碰 EMA 距離 (ATR 倍數)", minval = 0, step = 0.1, group = G_IN, tooltip = "K棒高低點進入 EMA ± ATR × 此值的範圍，就算碰到 EMA 附近。")
+int    pbLook      = input.int(5, "回檔有效K棒數", minval = 1, group = G_IN, tooltip = "最近 N 根K棒內（含本根）碰過 EMA 附近或支撐（做空：壓力），本根收盤重新站上（跌破）EMA 才算數。")
+int    rsiLen      = input.int(14, "RSI 長度", minval = 1, group = G_IN)
+float  rsiLvl      = input.float(50.0, "RSI 穿越值", minval = 0, maxval = 100, group = G_IN)
+int    volLen      = input.int(20, "均量週期", minval = 1, group = G_IN)
+float  sigVolMult  = input.float(1.3, "訊號成交量倍數", minval = 0, step = 0.1, group = G_IN, tooltip = "成交量 > 均量 × 此倍數。")
+int    adxLen      = input.int(14, "ADX 長度", minval = 1, group = G_IN)
+float  adxMin      = input.float(20.0, "ADX 需大於", minval = 0, group = G_IN, tooltip = "低於此值視為盤整，不出訊號。")
+float  roomMult    = input.float(1.5, "前方強壓力 / 強支撐最小距離 (ATR 倍數)", minval = 0, step = 0.1, group = G_IN, tooltip = "做多：上方最近的強壓力距離需大於 ATR × 此值；做空：下方最近的強支撐。")
+bool   roomStrong  = input.bool(true, "只計算強壓力 / 強支撐", group = G_IN, tooltip = "關閉後，一般壓力 / 支撐也算。")
+int    coolBars    = input.int(10, "同方向訊號最少間隔K棒", minval = 1, group = G_IN, tooltip = "出一個訊號後，這麼多根K棒內不再出同方向訊號。")
+int    strongLook  = input.int(1, "「強」：帶量突破 / 支撐反彈 出現在最近幾根K棒", minval = 1, group = G_IN, tooltip = "1 = 與訊號同一根K棒。做空對應帶量跌破 / 壓力回落。")
+
+int    atrLen      = input.int(14, "ATR 週期", minval = 1, group = G_RK)
+float  slAtr       = input.float(1.5, "停損：ATR 倍數", minval = 0.1, step = 0.1, group = G_RK)
+int    swingLen    = input.int(10, "停損：波段高低點回看K棒數", minval = 1, group = G_RK)
+float  swingBuf    = input.float(0.1, "停損：波段外側緩衝 (ATR 倍數)", minval = 0, step = 0.05, group = G_RK)
+float  slMinAtr    = input.float(1.0, "停損：最小距離 (ATR 倍數)", minval = 0, step = 0.1, group = G_RK, tooltip = "ATR 停損與波段外側停損取較近者，但距離不小於 ATR × 此值。")
+float  tp1R        = input.float(1.5, "停利 1 (R 倍數)", minval = 0.1, step = 0.1, group = G_RK)
+float  tp1Pct      = input.float(50.0, "停利 1 出場比例 %", minval = 1, maxval = 100, group = G_RK)
+float  tp2R        = input.float(3.0, "停利 2 (R 倍數)", minval = 0.1, step = 0.1, group = G_RK)
+string exitMode    = input.string(EX_FIX, "剩餘部位出場方式", options = [EX_FIX, EX_TRAIL, EX_BOTH], group = G_RK)
+float  trailAtr    = input.float(2.0, "移動停損 ATR 倍數", minval = 0.1, step = 0.1, group = G_RK, tooltip = "停利 1 之後啟動：持倉期間最高價（做空：最低價）回落 ATR × 此值即出場，停損只會往有利方向移動。")
+float  riskPct     = input.float(5.0, "每筆風險 %（權益）", minval = 0.1, step = 0.5, group = G_RK, tooltip = "以目前策略權益計算（會隨盈虧複利）。")
+float  maxLev      = input.float(5.0, "槓桿上限", minval = 1, step = 0.5, group = G_RK, tooltip = "依風險算出的倉位超過此槓桿時，倉位縮到上限，實際風險會小於設定。")
+int    maxLoss     = input.int(2, "同一天連虧幾筆後停止出訊號", minval = 1, group = G_RK)
+string dayTz       = input.string("UTC+8", "「同一天」使用的時區", group = G_RK, tooltip = "例如 UTC+8（台灣）、UTC。每天 00:00 連虧次數歸零。")
+
+int    pivotLen    = input.int(10, "前高 / 前低 左右K棒數", minval = 2, group = G_LV, tooltip = "轉折高點(低點)左右兩側各需幾根K棒比它低(高)。數字越大，價位越少、越重要。")
+int    strongTouch = input.int(3, "強支撐 / 強壓力 觸碰次數", minval = 2, group = G_LV)
+float  mergeMult   = input.float(1.0, "同一價位合併距離 (ATR 倍數)", minval = 0.1, step = 0.1, group = G_LV)
+float  zoneMult    = input.float(0.3, "區間寬度 (ATR 倍數)", minval = 0.0, step = 0.05, group = G_LV)
+float  volMult     = input.float(1.5, "帶量突破倍數", minval = 1.0, step = 0.1, group = G_LV, tooltip = "突破K棒的成交量 ≥ 均量 × 此倍數，才算「帶量突破 / 帶量跌破」。")
+int    fakeBars    = input.int(3, "假突破判定K棒數", minval = 1, group = G_LV)
+int    coolDown    = input.int(5, "反彈 / 回落 訊號最少間隔K棒", minval = 1, group = G_LV)
+
+color  emaCol      = input.color(#ffb300, "EMA", inline = "c2", group = G_STY)
+color  slCol       = input.color(#f23645, "停損線", inline = "c2", group = G_STY)
+color  tpCol       = input.color(#089981, "停利線", inline = "c2", group = G_STY)
+color  bgBullCol   = input.color(#00c853, "長線偏多背景", inline = "c4", group = G_STY)
+color  bgBearCol   = input.color(#ff1744, "長線偏空背景", inline = "c4", group = G_STY)
+int    bgTransp    = input.int(92, "背景透明度", minval = 0, maxval = 100, group = G_STY)
+bool   showEma     = input.bool(true, "顯示回檔 EMA", group = G_STY)
+
+// ─────────────────────────── 型別與函式 ───────────────────────────
+type Level
+    float price
+    int   touches  = 1
+    bool  isRes    = false
+    int   startBar
+    int   lastBar
+    int   breakDir = 0    // 1 = 剛帶量突破，-1 = 剛帶量跌破（用於判定假突破 / 假跌破）
+    int   breakBar = 0
+
+toSize(string s) =>
+    switch s
+        "小" => size.small
+        "中" => size.normal
+        "大" => size.large
+        => size.huge
+
+// 依位置與觸碰次數命名：強支撐 / 支撐 / 強壓力 / 壓力
+lvName(bool isRes, int touches) =>
+    string base = isRes ? "壓力" : "支撐"
+    touches >= strongTouch ? "強" + base : base
+
+addLine(string a, string b) =>
+    a == "" ? b : a + "\n" + b
+
+fmt(float p) =>
+    str.tostring(p, format.mintick)
+
+// 在高週期資料上計算：[收盤, 快線 EMA, N 根前的快線, 慢線 EMA, RSI, ADX]
+// 搭配 lookahead 關閉使用，確保只拿「已收盤」的高週期K棒：
+//  • 歷史K棒：高週期K棒收盤的那一根才換新值，呼叫端再往前取一根 → 整段期間都是上一根已收盤的高週期K棒
+//  • 即時K棒：在高週期這邊直接取前一根 → 同樣是上一根已收盤的高週期K棒
+//  歷史與即時一致，不偷看未來、不重繪
+htfCalc(simple int fastLen, simple int slowLen, simple int slopeBars, simple int rsiN, simple int adxN) =>
+    int   o  = barstate.isrealtime ? 1 : 0
+    float ef = ta.ema(close, fastLen)
+    float es = ta.ema(close, slowLen)
+    float r  = ta.rsi(close, rsiN)
+    [dp, dm, a] = ta.dmi(adxN, adxN)
+    [close[o], ef[o], ef[o + slopeBars], es[o], r[o], a[o]]
+
+// ─────────────────────────── 高週期趨勢 ───────────────────────────
+[wC, wE, wEp, wEs, wR, wA] = request.security(syminfo.tickerid, tfW, htfCalc(wEmaLen, wEmaLen, wSlopeBars, wRsiLen, hAdxLen), lookahead = barmerge.lookahead_off)
+[dC, dE, dEp, dEs, dR, dA] = request.security(syminfo.tickerid, tfD, htfCalc(dFastLen, dSlowLen, 1, wRsiLen, hAdxLen), lookahead = barmerge.lookahead_off)
+[hC, hE, hEp, hEs, hR, hA] = request.security(syminfo.tickerid, tfH, htfCalc(hFastLen, hSlowLen, 1, wRsiLen, hAdxLen), lookahead = barmerge.lookahead_off)
+
+int   ro      = barstate.isrealtime ? 0 : 1    // 歷史K棒往前取一根（見 htfCalc 說明）
+float wClose  = wC[ro]
+float wEma    = wE[ro]
+float wEmaPv  = wEp[ro]
+float wRsi    = wR[ro]
+float dFast   = dE[ro]
+float dSlow   = dEs[ro]
+float hFast   = hE[ro]
+float hSlow   = hEs[ro]
+float hAdx    = hA[ro]
+
+// 長線（半年）：4 個條件計分
+bool  wReady  = not na(wClose) and not na(wEma) and not na(wEmaPv) and not na(wRsi)
+bool  dReady  = not na(dFast) and not na(dSlow)
+bool  ltReady = wReady and dReady
+bool  c1      = wClose > wEma       // 週線收盤 > 週線 EMA50
+bool  c2      = wEma > wEmaPv       // 週線 EMA50 比 4 週前高
+bool  c3      = dFast > dSlow       // 日線 EMA50 > EMA200
+bool  c4      = wRsi > wRsiLvl      // 週線 RSI > 50
+int   ltScore = (c1 ? 1 : 0) + (c2 ? 1 : 0) + (c3 ? 1 : 0) + (c4 ? 1 : 0)
+int   ltDir   = not ltReady ? 0 : ltScore >= bullNeed ? 1 : ltScore <= bearMax ? -1 : 0
+
+// 4 小時：EMA50 / EMA200 方向，ADX 判斷是否明確
+bool  hReady  = not na(hFast) and not na(hSlow) and not na(hAdx)
+bool  hBull   = hReady and hFast > hSlow
+bool  hBear   = hReady and hFast < hSlow
+bool  hClear  = hReady and hAdx > hAdxClear
+bool  allowL  = hBull and ltDir != -1 and (ltDir == 1 or hClear)
+bool  allowS  = hBear and ltDir != 1 and (ltDir == -1 or hClear)
+
+// ─────────────────────────── 基礎數值 ───────────────────────────
+float atr     = ta.atr(atrLen)
+float vol     = nz(volume)
+float volMA   = ta.sma(vol, volLen)
+bool  hasVol  = not na(volMA) and volMA > 0
+bool  volOK   = not hasVol or vol >= volMA * volMult
+float z       = nz(atr) * zoneMult / 2
+bool  canSig  = barstate.isconfirmed
+
+// 實體突破：實體至少佔整根K棒一半（排除長影線的假動作）
+float rng       = high - low
+bool  bullBody  = close > open and close - open >= rng * 0.5
+bool  bearBody  = close < open and open - close >= rng * 0.5
+
+// 止跌 / 止漲 K棒型態（長影線 / 吞噬 / 量縮）
+float lowerWick = math.min(open, close) - low
+float upperWick = high - math.max(open, close)
+bool  longLower = rng > 0 and lowerWick >= rng * 0.5
+bool  longUpper = rng > 0 and upperWick >= rng * 0.5
+bool  bullEng   = close > open and close[1] < open[1] and close >= open[1] and open <= close[1]
+bool  bearEng   = close < open and close[1] > open[1] and close <= open[1] and open >= close[1]
+bool  dryBull   = hasVol and vol < volMA and close > open and low >= low[1]
+bool  dryBear   = hasVol and vol < volMA and close < open and high <= high[1]
+bool  bullStop  = longLower or bullEng or dryBull
+bool  bearStop  = longUpper or bearEng or dryBear
+
+// ─────────────────────────── 支撐 / 壓力追蹤（沿用 support_resistance.pine） ───────────────────────────
+const int MAX_LEVELS = 40
+var array<Level> levels = array.new<Level>()
+var int lastBounce = -1000000
+var int lastReject = -1000000
+
+bool sigBreakUp  = false   // 帶量突破
+bool sigBreakDn  = false   // 帶量跌破
+bool sigBounce   = false   // 支撐反彈
+bool sigReject   = false   // 壓力回落
+bool bounceReady = bar_index - lastBounce > coolDown
+bool rejectReady = bar_index - lastReject > coolDown
+
+if not na(atr)
+    for lv in levels
+        float top  = lv.price + z
+        float bot  = lv.price - z
+        bool  done = false
+
+        // ① 假突破 / 假跌破：帶量突破(跌破)後 N 根K棒內收盤又回到另一側 → 角色改回（不另外標示）
+        if lv.breakDir != 0
+            int age = bar_index - lv.breakBar
+            if age > fakeBars
+                lv.breakDir := 0
+            else if age > 0 and lv.breakDir == 1 and close < lv.price
+                lv.breakDir := 0
+                lv.isRes    := true
+                done        := true
+            else if age > 0 and lv.breakDir == -1 and close > lv.price
+                lv.breakDir := 0
+                lv.isRes    := false
+                done        := true
+
+        if not done
+            // ② 收盤價超出區間 → 角色互換；帶量 + 實體K棒才算「帶量突破 / 帶量跌破」
+            if lv.isRes and close > top
+                lv.isRes := false
+                if volOK and bullBody
+                    lv.breakDir := 1
+                    lv.breakBar := bar_index
+                    if canSig
+                        sigBreakUp := true
+            else if not lv.isRes and close < bot
+                lv.isRes := true
+                if volOK and bearBody
+                    lv.breakDir := -1
+                    lv.breakBar := bar_index
+                    if canSig
+                        sigBreakDn := true
+            // ③ 回測支撐並出現止跌K棒 → 支撐反彈；反彈到壓力並出現止漲K棒 → 壓力回落
+            else if not lv.isRes and low <= top and close > lv.price and bullStop and bounceReady and math.min(low[2], low[3]) > top
+                if canSig
+                    sigBounce := true
+            else if lv.isRes and high >= bot and close < lv.price and bearStop and rejectReady and math.max(high[2], high[3]) < bot
+                if canSig
+                    sigReject := true
+
+if sigBounce
+    lastBounce := bar_index
+if sigReject
+    lastReject := bar_index
+
+// 新的前高 / 前低：靠近既有價位就合併（觸碰 +1），否則新增
+addLevel(float p, int pBar) =>
+    int   idx  = -1
+    float best = atr * mergeMult
+    for [i, lv] in levels
+        float d = math.abs(lv.price - p)
+        if d <= best
+            best := d
+            idx  := i
+    if idx >= 0
+        Level hit = levels.get(idx)
+        hit.price   := (hit.price * hit.touches + p) / (hit.touches + 1)
+        hit.touches := hit.touches + 1
+        hit.lastBar := pBar
+    else
+        levels.push(Level.new(price = p, isRes = close < p, startBar = pBar, lastBar = pBar))
+        if levels.size() > MAX_LEVELS
+            int old = 0
+            for i = 1 to levels.size() - 1
+                if levels.get(i).lastBar < levels.get(old).lastBar
+                    old := i
+            levels.remove(old)
+    idx
+
+float ph = ta.pivothigh(high, pivotLen, pivotLen)
+float pl = ta.pivotlow(low, pivotLen, pivotLen)
+
+if not na(atr)
+    if not na(ph)
+        addLevel(ph, bar_index - pivotLen)
+    if not na(pl)
+        addLevel(pl, bar_index - pivotLen)
+
+// 本根K棒是否碰到支撐 / 壓力區間，以及前方最近的（強）壓力 / 支撐距離
+bool  touchSup = false
+bool  touchRes = false
+float resGap   = na
+float supGap   = na
+if not na(atr)
+    for lv in levels
+        if low <= lv.price + z and high >= lv.price - z
+            if lv.isRes
+                touchRes := true
+            else
+                touchSup := true
+        if not roomStrong or lv.touches >= strongTouch
+            float g = lv.isRes ? lv.price - close : close - lv.price
+            if g > -z    // 排除剛合併、角色要到下一根K棒才更新的價位
+                if lv.isRes
+                    resGap := na(resGap) ? g : math.min(resGap, g)
+                else
+                    supGap := na(supGap) ? g : math.min(supGap, g)
+
+// ─────────────────────────── 短線進場條件 ───────────────────────────
+float emaF    = ta.ema(close, emaLen)
+float rsi     = ta.rsi(close, rsiLen)
+[diPlus, diMinus, adx] = ta.dmi(adxLen, adxLen)
+bool  rsiUp   = ta.crossover(rsi, rsiLvl)
+bool  rsiDn   = ta.crossunder(rsi, rsiLvl)
+float pbDist  = nz(atr) * pbAtr
+bool  nearEma = low <= emaF + pbDist and high >= emaF - pbDist
+int   sinceL  = ta.barssince(nearEma or touchSup)
+int   sinceS  = ta.barssince(nearEma or touchRes)
+bool  pullL   = nz(sinceL, pbLook) < pbLook and close > emaF     // 回檔碰 EMA 附近或支撐後，收盤重新站上 EMA
+bool  pullS   = nz(sinceS, pbLook) < pbLook and close < emaF     // 反彈碰 EMA 附近或壓力後，收盤重新跌破 EMA
+bool  volSig  = not hasVol or vol > volMA * sigVolMult
+bool  adxOK   = adx > adxMin
+bool  roomL   = na(resGap) or resGap > roomMult * atr
+bool  roomS   = na(supGap) or supGap > roomMult * atr
+bool  setupL  = allowL and pullL and rsiUp and volSig and adxOK and roomL
+bool  setupS  = allowS and pullS and rsiDn and volSig and adxOK and roomS
+
+// 現有指標的帶量突破 / 支撐反彈（做空：帶量跌破 / 壓力回落）同時出現 → 標籤加註「強」
+int   sinceBullSR = ta.barssince(sigBreakUp or sigBounce)
+int   sinceBearSR = ta.barssince(sigBreakDn or sigReject)
+bool  strongL     = nz(sinceBullSR, strongLook) < strongLook
+bool  strongS     = nz(sinceBearSR, strongLook) < strongLook
+
+// 停損距離：1.5 ATR 與波段低點(高點)外側取較近者，但不小於 1 ATR
+float swLo    = ta.lowest(low, swingLen)
+float swHi    = ta.highest(high, swingLen)
+float slDistL = math.max(math.min(slAtr * atr, close - (swLo - swingBuf * atr)), slMinAtr * atr)
+float slDistS = math.max(math.min(slAtr * atr, swHi + swingBuf * atr - close), slMinAtr * atr)
+
+// 每日歸零（依設定時區）
+int   dayKey  = year(time, dayTz) * 10000 + month(time, dayTz) * 100 + dayofmonth(time, dayTz)
+bool  newDay  = dayKey != dayKey[1]
+
+// ─────────────────────────── 下單與出場 ───────────────────────────
+bool useTp2   = exitMode != EX_TRAIL
+bool useTrail = exitMode != EX_FIX
+
+var int   sDir         = 0        // 1 = 做多中，-1 = 做空中，0 = 空手
+var float sStop        = na       // 目前停損（停利 1 之後可能移動）
+var float sTp1         = na
+var float sTp2         = na
+var float sPeak        = na
+var bool  sTp1Done     = false
+var int   lossStreak   = 0
+var int   lastClosed   = 0
+var float lastNet      = 0.0
+var int   lastLongBar  = -1000000
+var int   lastShortBar = -1000000
+
+if newDay
+    lossStreak := 0
+
+// ① 部位全部出場 → 以整筆（含分批出場）的淨損益判斷輸贏，算當日連虧
+if strategy.position_size == 0 and strategy.closedtrades > lastClosed
+    float pnl = strategy.netprofit - lastNet
+    lossStreak := pnl < 0 ? lossStreak + 1 : 0
+    lastClosed := strategy.closedtrades
+    lastNet    := strategy.netprofit
+    sDir       := 0
+
+// ② 持倉中：還有部位但已有平倉紀錄 = 停利 1 已成交；之後剩餘部位用 ATR 移動停損（只往有利方向移動）
+if strategy.position_size != 0 and sDir != 0
+    sTp1Done := sTp1Done or strategy.closedtrades > lastClosed
+    sPeak    := sDir == 1 ? math.max(sPeak, high) : math.min(sPeak, low)
+    if sTp1Done and useTrail
+        float tr = sPeak - sDir * trailAtr * atr
+        sStop := sDir == 1 ? math.max(sStop, tr) : math.min(sStop, tr)
+
+// ③ 訊號（與 trend_signals.pine 相同）：空手、今日未達連虧上限、同方向間隔足夠
+bool locked   = lossStreak >= maxLoss
+bool canTrade = canSig and sDir == 0 and strategy.position_size == 0 and not locked and atr > 0
+bool sigL     = canTrade and setupL and bar_index - lastLongBar > coolBars
+bool sigS     = canTrade and setupS and bar_index - lastShortBar > coolBars
+
+if sigL or sigS
+    int   d    = sigL ? 1 : -1
+    float dist = d == 1 ? slDistL : slDistS
+    float eq   = strategy.equity
+    // 倉位 = 權益 × 風險% ÷ 停損距離；超過槓桿上限就縮到上限
+    float q    = eq * riskPct / 100 / dist
+    if q * close / eq > maxLev
+        q := eq * maxLev / close
+    sDir     := d
+    sStop    := close - d * dist
+    sTp1     := close + d * tp1R * dist
+    sTp2     := close + d * tp2R * dist
+    sPeak    := close
+    sTp1Done := false
+    if d == 1
+        lastLongBar := bar_index
+    else
+        lastShortBar := bar_index
+    string txt = (d == 1 ? "▲ 做多" : "▼ 做空") + ((d == 1 ? strongL : strongS) ? "（強）" : "")
+    string msg = syminfo.ticker + " " + timeframe.period + "：" + txt + "\n進場 " + fmt(close) + "\n停損 " + fmt(sStop) + "\n停利1 " + fmt(sTp1) + "\n停利2 " + (useTp2 ? fmt(sTp2) : "ATR 移動停損") + "\n數量 " + str.tostring(q, "#.####") + "，槓桿 " + str.tostring(q * close / eq, "0.0") + "x"
+    strategy.entry(d == 1 ? "做多" : "做空", d == 1 ? strategy.long : strategy.short, qty = q, comment = txt, alert_message = msg)
+    alert(msg, alert.freq_once_per_bar_close)
+
+// ④ 出場單：停利 1（分批）+ 剩餘部位（停利 2 / 停損 / 移動停損），每根K棒更新停損價
+if sDir != 0
+    string eid = sDir == 1 ? "做多" : "做空"
+    if not sTp1Done
+        strategy.exit("停利1", eid, qty_percent = tp1Pct, limit = sTp1, stop = sStop, comment_profit = "停利1", comment_loss = "停損")
+    strategy.exit("出場", eid, limit = useTp2 ? sTp2 : na, stop = sStop, comment_profit = "停利2", comment_loss = sTp1Done and useTrail ? "移動停損" : "停損")
+
+// ─────────────────────────── 圖表 ───────────────────────────
+bgcolor(ltDir == 1 ? color.new(bgBullCol, bgTransp) : ltDir == -1 ? color.new(bgBearCol, bgTransp) : na, title = "長線背景")
+plot(showEma ? emaF : na, "回檔 EMA", color = emaCol, linewidth = 1)
+plot(sDir != 0 ? sStop : na, "停損", color = slCol, style = plot.style_linebr, linewidth = 2)
+plot(sDir != 0 and not sTp1Done ? sTp1 : na, "停利 1", color = tpCol, style = plot.style_linebr, linewidth = 1)
+plot(sDir != 0 and useTp2 ? sTp2 : na, "停利 2", color = tpCol, style = plot.style_linebr, linewidth = 2)
+plot(ltScore, "長線分數", display = display.data_window)
+plot(lossStreak, "今日連虧", display = display.data_window)
