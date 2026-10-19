@@ -5,7 +5,8 @@ indicator("趨勢訊號", shorttitle = "趨勢訊號", overlay = true, max_lines
 //  趨勢訊號 —— 長線方向過濾 + 日內回檔進場 + 支撐壓力 + 風險控管
 //  • 長線（半年）方向：週線 / 日線 4 個條件，3 個以上成立偏多、1 個以下偏空
 //  • 短線訊號：設計給 15 分 / 1 小時圖，所有條件同時成立才出訊號（少而準）
-//  • 停損 / 停利 / 建議倉位與槓桿；同一天連虧達設定筆數即停止出訊號
+//  • 盤整過濾：ADX 下降中、或價格在近 50 根K棒區間中段時不出訊號
+//  • 停損 / 停利 / 建議倉位與槓桿；同一天連虧 2 筆停止、連續虧損 3 筆暫停 20 根K棒
 //  • 支撐壓力判定沿用 support_resistance.pine
 //  • 高週期資料只用已收盤的K棒（lookahead 關閉），不使用未來資料
 //  • 回測請用同一套規則的 trend_strategy.pine
@@ -15,9 +16,10 @@ indicator("趨勢訊號", shorttitle = "趨勢訊號", overlay = true, max_lines
 const string G_LT  = "① 長線趨勢（週線 / 日線）"
 const string G_MT  = "② 4 小時趨勢"
 const string G_IN  = "③ 短線進場條件"
-const string G_RK  = "④ 停損 / 停利 / 倉位"
-const string G_LV  = "⑤ 支撐 / 壓力（沿用 support_resistance）"
-const string G_STY = "⑥ 外觀"
+const string G_CH  = "④ 盤整過濾"
+const string G_RK  = "⑤ 停損 / 停利 / 倉位"
+const string G_LV  = "⑥ 支撐 / 壓力（沿用 support_resistance）"
+const string G_STY = "⑦ 外觀"
 
 const string EX_FIX   = "固定 R 倍數"
 const string EX_TRAIL = "ATR 移動停損"
@@ -54,6 +56,12 @@ bool   roomStrong  = input.bool(true, "只計算強壓力 / 強支撐", group = 
 int    coolBars    = input.int(10, "同方向訊號最少間隔K棒", minval = 1, group = G_IN, tooltip = "出一個訊號後，這麼多根K棒內不再出同方向訊號。")
 int    strongLook  = input.int(1, "「強」：帶量突破 / 支撐反彈 出現在最近幾根K棒", minval = 1, group = G_IN, tooltip = "1 = 與訊號同一根K棒。做空對應帶量跌破 / 壓力回落。")
 
+bool   useAdxFall  = input.bool(true, "ADX 正在下降時不出訊號", group = G_CH, tooltip = "ADX 低於 N 根K棒前的值 = 趨勢轉弱，不出訊號。")
+int    adxFallBars = input.int(1, "ADX 下降：與幾根K棒前比較", minval = 1, group = G_CH)
+bool   useRange    = input.bool(true, "價格在區間中段時不出訊號", group = G_CH, tooltip = "收盤價位於最近 N 根K棒最高～最低區間的中段時，不出訊號。")
+int    rangeLen    = input.int(50, "區間回看K棒數", minval = 2, group = G_CH)
+float  rangeMid    = input.float(50.0, "中段寬度 %", minval = 0, maxval = 100, step = 5, group = G_CH, tooltip = "50 = 位於區間 25%～75% 不出訊號；只在靠近區間上緣或下緣時才出訊號。")
+
 int    atrLen      = input.int(14, "ATR 週期", minval = 1, group = G_RK)
 float  slAtr       = input.float(1.5, "停損：ATR 倍數", minval = 0.1, step = 0.1, group = G_RK)
 int    swingLen    = input.int(10, "停損：波段高低點回看K棒數", minval = 1, group = G_RK)
@@ -65,9 +73,12 @@ float  tp2R        = input.float(3.0, "停利 2 (R 倍數)", minval = 0.1, step 
 string exitMode    = input.string(EX_FIX, "剩餘部位出場方式", options = [EX_FIX, EX_TRAIL, EX_BOTH], group = G_RK)
 float  trailAtr    = input.float(2.0, "移動停損 ATR 倍數", minval = 0.1, step = 0.1, group = G_RK, tooltip = "停利 1 之後啟動：持倉期間最高價（做空：最低價）回落 ATR × 此值即出場，停損只會往有利方向移動。")
 float  capital     = input.float(10000.0, "本金", minval = 1, group = G_RK, tooltip = "用來計算建議倉位與槓桿。")
-float  riskPct     = input.float(5.0, "每筆風險 %（本金）", minval = 0.1, step = 0.5, group = G_RK)
+float  riskPct     = input.float(2.0, "每筆風險 %（本金）", minval = 0.1, step = 0.5, group = G_RK)
 float  maxLev      = input.float(5.0, "槓桿上限", minval = 1, step = 0.5, group = G_RK, tooltip = "依風險算出的倉位超過此槓桿時，倉位縮到上限，實際風險會小於設定。")
 int    maxLoss     = input.int(2, "同一天連虧幾筆後停止出訊號", minval = 1, group = G_RK)
+bool   usePause    = input.bool(true, "連虧暫停", group = G_RK, tooltip = "不分日期，連續虧損達設定筆數後，暫停一段K棒不出訊號；暫停後連虧重新計算。")
+int    pauseLoss   = input.int(3, "連虧暫停：連續虧損幾筆", minval = 1, group = G_RK)
+int    pauseBars   = input.int(20, "連虧暫停：暫停幾根K棒", minval = 1, group = G_RK)
 string dayTz       = input.string("UTC+8", "「同一天」使用的時區", group = G_RK, tooltip = "例如 UTC+8（台灣）、UTC。每天 00:00 連虧次數歸零。")
 
 int    pivotLen    = input.int(10, "前高 / 前低 左右K棒數", minval = 2, group = G_LV, tooltip = "轉折高點(低點)左右兩側各需幾根K棒比它低(高)。數字越大，價位越少、越重要。")
@@ -331,8 +342,17 @@ bool  volSig  = not hasVol or vol > volMA * sigVolMult
 bool  adxOK   = adx > adxMin
 bool  roomL   = na(resGap) or resGap > roomMult * atr
 bool  roomS   = na(supGap) or supGap > roomMult * atr
-bool  setupL  = allowL and pullL and rsiUp and volSig and adxOK and roomL
-bool  setupS  = allowS and pullS and rsiDn and volSig and adxOK and roomS
+
+// 盤整過濾：ADX 正在下降，或收盤價在近 N 根K棒高低區間的中段 → 不出訊號
+bool  adxFalling = adx < adx[adxFallBars]
+float rangeHi    = ta.highest(high, rangeLen)
+float rangeLo    = ta.lowest(low, rangeLen)
+float rangePos   = rangeHi > rangeLo ? (close - rangeLo) / (rangeHi - rangeLo) * 100 : na    // 0 = 區間最低，100 = 區間最高
+bool  inMid      = not na(rangePos) and math.abs(rangePos - 50) <= rangeMid / 2
+bool  chopOK     = not (useAdxFall and adxFalling) and not (useRange and inMid)
+
+bool  setupL  = allowL and pullL and rsiUp and volSig and adxOK and roomL and chopOK
+bool  setupS  = allowS and pullS and rsiDn and volSig and adxOK and roomS and chopOK
 
 // 現有指標的帶量突破 / 支撐反彈（做空：帶量跌破 / 壓力回落）同時出現 → 標籤加註「強」
 int   sinceBullSR = ta.barssince(sigBreakUp or sigBounce)
@@ -373,7 +393,9 @@ var float  tQty       = na
 var float  tLev       = na
 var float  tRealRk    = na       // 實際風險 %（受槓桿上限時會小於設定）
 var string lastRes    = ""
-var int    lossStreak = 0
+var int    lossStreak = 0        // 今日連虧（每天歸零）
+var int    lossRun    = 0        // 連續虧損（不分日期，用於連虧暫停）
+var int    pauseUntil = -1       // 連虧暫停到這根K棒為止
 var int    lastLongBar  = -1000000
 var int    lastShortBar = -1000000
 
@@ -432,6 +454,10 @@ if tDir != 0 and bar_index > tBar
     if tLeft <= 0
         tradeEnd   := true
         lossStreak := tPnlR < 0 ? lossStreak + 1 : 0
+        lossRun    := tPnlR < 0 ? lossRun + 1 : 0
+        if usePause and lossRun >= pauseLoss
+            pauseUntil := bar_index + pauseBars
+            lossRun    := 0
         lastRes    := (d == 1 ? "做多 " : "做空 ") + exitTxt + " " + (tPnlR >= 0 ? "+" : "") + str.tostring(tPnlR, "0.00") + "R"
         tDir       := 0
     else
@@ -459,7 +485,8 @@ if tradeEnd and showResult
 
 // ─────────────────────────── 訊號 ───────────────────────────
 bool locked   = lossStreak >= maxLoss
-bool canTrade = canSig and tDir == 0 and not locked and atr > 0
+bool paused   = bar_index <= pauseUntil
+bool canTrade = canSig and tDir == 0 and not locked and not paused and atr > 0
 bool sigL     = canTrade and setupL and bar_index - lastLongBar > coolBars
 bool sigS     = canTrade and setupS and bar_index - lastShortBar > coolBars
 
@@ -577,15 +604,17 @@ if barstate.islast and showLevels
 
 // ─────────────────────────── 圖表 ───────────────────────────
 bgcolor(ltDir == 1 ? color.new(bgBullCol, bgTransp) : ltDir == -1 ? color.new(bgBearCol, bgTransp) : na, title = "長線背景")
+bgcolor(paused ? color.new(color.gray, 85) : na, title = "連虧暫停")
 plot(showEma ? emaF : na, "回檔 EMA", color = emaCol, linewidth = 1)
 plot(tDir != 0 and tTp1Hit and useTrail ? tStop : na, "移動停損", color = slCol, style = plot.style_linebr, linewidth = 2)
 plot(ltScore, "長線分數", display = display.data_window)
 plot(hAdx, "4 小時 ADX", display = display.data_window)
 plot(adx, "ADX", display = display.data_window)
 plot(hasVol ? vol / volMA : na, "量比", display = display.data_window)
+plot(rangePos, "區間位置 %", display = display.data_window)
 
 // ─────────────────────────── 右上角表格 ───────────────────────────
-var table tb = table.new(position.top_right, 2, 14, bgcolor = color.new(#131722, 15), frame_color = color.new(#787b86, 40), frame_width = 1, border_color = color.new(#787b86, 75), border_width = 1)
+var table tb = table.new(position.top_right, 2, 15, bgcolor = color.new(#131722, 15), frame_color = color.new(#787b86, 40), frame_width = 1, border_color = color.new(#787b86, 75), border_width = 1)
 
 dirColor(int d) =>
     d == 1 ? bullCol : d == -1 ? bearCol : color.silver
@@ -611,26 +640,32 @@ if barstate.islast
     string hTxt = not hReady ? "資料不足" : (hBull ? "多頭" : hBear ? "空頭" : "持平") + "（ADX " + str.tostring(hAdx, "0.0") + (hClear ? "，明確" : "") + "）"
     setRow(4, "4 小時趨勢", hTxt, dirColor(hBull ? 1 : hBear ? -1 : 0))
 
-    string biasTxt = locked ? "觀望（今日已連虧 " + str.tostring(lossStreak) + " 筆，停止出訊號）" : allowL ? "多" : allowS ? "空" : "觀望"
-    setRow(5, "今日偏向", biasTxt, dirColor(locked ? 0 : allowL ? 1 : allowS ? -1 : 0))
-    setRow(6, "今日連虧", str.tostring(lossStreak) + " / " + str.tostring(maxLoss) + " 筆", lossStreak > 0 ? bearCol : color.silver)
+    string chopTxt = not useAdxFall and not useRange ? "關閉" : chopOK ? "通過" : "盤整中，不出訊號"
+    chopTxt += "（ADX " + (adxFalling ? "下降" : "上升") + "，區間位置 " + (na(rangePos) ? "—" : str.tostring(rangePos, "0") + "%") + "）"
+    setRow(5, "盤整過濾", chopTxt, chopOK ? color.silver : bearCol)
+
+    int    pauseLeft = pauseUntil - bar_index
+    string biasTxt   = locked ? "觀望（今日已連虧 " + str.tostring(lossStreak) + " 筆，停止出訊號）" : paused ? "觀望（連虧暫停，剩 " + str.tostring(pauseLeft) + " 根K棒）" : allowL ? "多" : allowS ? "空" : "觀望"
+    setRow(6, "今日偏向", biasTxt, dirColor(locked or paused ? 0 : allowL ? 1 : allowS ? -1 : 0))
+    string lossTxt   = "今日 " + str.tostring(lossStreak) + " / " + str.tostring(maxLoss) + " 筆" + (usePause ? " · 連續 " + str.tostring(lossRun) + " / " + str.tostring(pauseLoss) + " 筆" : "") + (paused ? " · 暫停中" : "")
+    setRow(7, "連虧", lossTxt, lossStreak > 0 or lossRun > 0 or paused ? bearCol : color.silver)
 
     bool   hasT   = not na(tEntry)
     bool   live   = tDir != 0
     string nowTxt = live ? (tDir == 1 ? "▲ 做多" : "▼ 做空") + (tStrong ? "（強）" : "") + (tTp1Hit ? " · 已達停利1" : " · 持倉中") : "無" + (lastRes != "" ? "（上一筆：" + lastRes + "）" : "")
-    setRow(7, "目前訊號", nowTxt, dirColor(tDir))
+    setRow(8, "目前訊號", nowTxt, dirColor(tDir))
 
     string prevTag = live ? "" : "（上一筆）"
-    setRow(8, "進場價", hasT ? fmt(tEntry) + prevTag : "—", color.white)
+    setRow(9, "進場價", hasT ? fmt(tEntry) + prevTag : "—", color.white)
     string slTxt = not hasT ? "—" : tStop != tInitSL ? fmt(tStop) + "（移動停損）" : fmt(tStop) + "（" + str.tostring(tRisk / tEntry * 100, "0.00") + "%，" + str.tostring(tRisk / tAtr, "0.0") + " ATR）"
-    setRow(9, "停損", slTxt + (hasT ? prevTag : ""), slCol)
-    setRow(10, "停利 1", hasT ? fmt(tTp1) + "（" + str.tostring(tp1R) + "R，出 " + str.tostring(tp1Pct) + "%）" + prevTag : "—", tpCol)
+    setRow(10, "停損", slTxt + (hasT ? prevTag : ""), slCol)
+    setRow(11, "停利 1", hasT ? fmt(tTp1) + "（" + str.tostring(tp1R) + "R，出 " + str.tostring(tp1Pct) + "%）" + prevTag : "—", tpCol)
     string tp2Txt = exitMode == EX_TRAIL ? "剩餘部位用 ATR 移動停損" : fmt(tTp2) + "（" + str.tostring(tp2R) + "R" + (exitMode == EX_BOTH ? "，或移動停損" : "") + "）"
-    setRow(11, "停利 2", hasT ? tp2Txt + prevTag : "—", tpCol)
+    setRow(12, "停利 2", hasT ? tp2Txt + prevTag : "—", tpCol)
     string qtyTxt = hasT ? str.tostring(tQty, "#.####") + " " + baseCcy + "（≈ " + str.tostring(tQty * tEntry, "#,##0") + " " + syminfo.currency + "）" : "—"
-    setRow(12, "建議倉位", qtyTxt, color.white)
+    setRow(13, "建議倉位", qtyTxt, color.white)
     string levTxt = hasT ? str.tostring(tLev, "0.0") + "x（上限 " + str.tostring(maxLev) + "x，風險 " + str.tostring(tRealRk, "0.0") + "%）" : "—"
-    setRow(13, "建議槓桿", levTxt, color.white)
+    setRow(14, "建議槓桿", levTxt, color.white)
 
 // ─────────────────────────── 警報 ───────────────────────────
 alertcondition(sigL, "做多訊號", "{{ticker}} {{interval}}：▲ 做多，收盤 {{close}}")

@@ -8,7 +8,8 @@ strategy("趨勢策略", shorttitle = "趨勢策略", overlay = true, initial_ca
 //  • 每筆風險 = 權益 × 風險%，倉位 = 風險金額 ÷ 停損距離，槓桿超過上限就縮倉
 //  • 保證金比例設 10%（回測最多允許 10 倍），實際槓桿由「槓桿上限」輸入控制（預設 5 倍）
 //  • 停利 1 分批出場，剩餘部位用停利 2 / 停損 / ATR 移動停損出場
-//  • 同一天連虧達設定筆數即停止進場
+//  • 盤整過濾：ADX 下降中、或價格在近 50 根K棒區間中段時不進場
+//  • 同一天連虧 2 筆停止進場；連續虧損 3 筆暫停 20 根K棒
 //  • 支撐壓力判定沿用 support_resistance.pine；高週期資料只用已收盤K棒（lookahead 關閉）
 // ════════════════════════════════════════════════════════════════════
 
@@ -16,9 +17,10 @@ strategy("趨勢策略", shorttitle = "趨勢策略", overlay = true, initial_ca
 const string G_LT  = "① 長線趨勢（週線 / 日線）"
 const string G_MT  = "② 4 小時趨勢"
 const string G_IN  = "③ 短線進場條件"
-const string G_RK  = "④ 停損 / 停利 / 倉位"
-const string G_LV  = "⑤ 支撐 / 壓力（沿用 support_resistance）"
-const string G_STY = "⑥ 外觀"
+const string G_CH  = "④ 盤整過濾"
+const string G_RK  = "⑤ 停損 / 停利 / 倉位"
+const string G_LV  = "⑥ 支撐 / 壓力（沿用 support_resistance）"
+const string G_STY = "⑦ 外觀"
 
 const string EX_FIX   = "固定 R 倍數"
 const string EX_TRAIL = "ATR 移動停損"
@@ -55,6 +57,12 @@ bool   roomStrong  = input.bool(true, "只計算強壓力 / 強支撐", group = 
 int    coolBars    = input.int(10, "同方向訊號最少間隔K棒", minval = 1, group = G_IN, tooltip = "出一個訊號後，這麼多根K棒內不再出同方向訊號。")
 int    strongLook  = input.int(1, "「強」：帶量突破 / 支撐反彈 出現在最近幾根K棒", minval = 1, group = G_IN, tooltip = "1 = 與訊號同一根K棒。做空對應帶量跌破 / 壓力回落。")
 
+bool   useAdxFall  = input.bool(true, "ADX 正在下降時不出訊號", group = G_CH, tooltip = "ADX 低於 N 根K棒前的值 = 趨勢轉弱，不出訊號。")
+int    adxFallBars = input.int(1, "ADX 下降：與幾根K棒前比較", minval = 1, group = G_CH)
+bool   useRange    = input.bool(true, "價格在區間中段時不出訊號", group = G_CH, tooltip = "收盤價位於最近 N 根K棒最高～最低區間的中段時，不出訊號。")
+int    rangeLen    = input.int(50, "區間回看K棒數", minval = 2, group = G_CH)
+float  rangeMid    = input.float(50.0, "中段寬度 %", minval = 0, maxval = 100, step = 5, group = G_CH, tooltip = "50 = 位於區間 25%～75% 不出訊號；只在靠近區間上緣或下緣時才出訊號。")
+
 int    atrLen      = input.int(14, "ATR 週期", minval = 1, group = G_RK)
 float  slAtr       = input.float(1.5, "停損：ATR 倍數", minval = 0.1, step = 0.1, group = G_RK)
 int    swingLen    = input.int(10, "停損：波段高低點回看K棒數", minval = 1, group = G_RK)
@@ -65,9 +73,12 @@ float  tp1Pct      = input.float(50.0, "停利 1 出場比例 %", minval = 1, ma
 float  tp2R        = input.float(3.0, "停利 2 (R 倍數)", minval = 0.1, step = 0.1, group = G_RK)
 string exitMode    = input.string(EX_FIX, "剩餘部位出場方式", options = [EX_FIX, EX_TRAIL, EX_BOTH], group = G_RK)
 float  trailAtr    = input.float(2.0, "移動停損 ATR 倍數", minval = 0.1, step = 0.1, group = G_RK, tooltip = "停利 1 之後啟動：持倉期間最高價（做空：最低價）回落 ATR × 此值即出場，停損只會往有利方向移動。")
-float  riskPct     = input.float(5.0, "每筆風險 %（權益）", minval = 0.1, step = 0.5, group = G_RK, tooltip = "以目前策略權益計算（會隨盈虧複利）。")
+float  riskPct     = input.float(2.0, "每筆風險 %（權益）", minval = 0.1, step = 0.5, group = G_RK, tooltip = "以目前策略權益計算（會隨盈虧複利）。")
 float  maxLev      = input.float(5.0, "槓桿上限", minval = 1, step = 0.5, group = G_RK, tooltip = "依風險算出的倉位超過此槓桿時，倉位縮到上限，實際風險會小於設定。")
 int    maxLoss     = input.int(2, "同一天連虧幾筆後停止出訊號", minval = 1, group = G_RK)
+bool   usePause    = input.bool(true, "連虧暫停", group = G_RK, tooltip = "不分日期，連續虧損達設定筆數後，暫停一段K棒不出訊號；暫停後連虧重新計算。")
+int    pauseLoss   = input.int(3, "連虧暫停：連續虧損幾筆", minval = 1, group = G_RK)
+int    pauseBars   = input.int(20, "連虧暫停：暫停幾根K棒", minval = 1, group = G_RK)
 string dayTz       = input.string("UTC+8", "「同一天」使用的時區", group = G_RK, tooltip = "例如 UTC+8（台灣）、UTC。每天 00:00 連虧次數歸零。")
 
 int    pivotLen    = input.int(10, "前高 / 前低 左右K棒數", minval = 2, group = G_LV, tooltip = "轉折高點(低點)左右兩側各需幾根K棒比它低(高)。數字越大，價位越少、越重要。")
@@ -319,8 +330,17 @@ bool  volSig  = not hasVol or vol > volMA * sigVolMult
 bool  adxOK   = adx > adxMin
 bool  roomL   = na(resGap) or resGap > roomMult * atr
 bool  roomS   = na(supGap) or supGap > roomMult * atr
-bool  setupL  = allowL and pullL and rsiUp and volSig and adxOK and roomL
-bool  setupS  = allowS and pullS and rsiDn and volSig and adxOK and roomS
+
+// 盤整過濾：ADX 正在下降，或收盤價在近 N 根K棒高低區間的中段 → 不出訊號
+bool  adxFalling = adx < adx[adxFallBars]
+float rangeHi    = ta.highest(high, rangeLen)
+float rangeLo    = ta.lowest(low, rangeLen)
+float rangePos   = rangeHi > rangeLo ? (close - rangeLo) / (rangeHi - rangeLo) * 100 : na    // 0 = 區間最低，100 = 區間最高
+bool  inMid      = not na(rangePos) and math.abs(rangePos - 50) <= rangeMid / 2
+bool  chopOK     = not (useAdxFall and adxFalling) and not (useRange and inMid)
+
+bool  setupL  = allowL and pullL and rsiUp and volSig and adxOK and roomL and chopOK
+bool  setupS  = allowS and pullS and rsiDn and volSig and adxOK and roomS and chopOK
 
 // 現有指標的帶量突破 / 支撐反彈（做空：帶量跌破 / 壓力回落）同時出現 → 標籤加註「強」
 int   sinceBullSR = ta.barssince(sigBreakUp or sigBounce)
@@ -348,7 +368,9 @@ var float sTp1         = na
 var float sTp2         = na
 var float sPeak        = na
 var bool  sTp1Done     = false
-var int   lossStreak   = 0
+var int   lossStreak   = 0        // 今日連虧（每天歸零）
+var int   lossRun      = 0        // 連續虧損（不分日期，用於連虧暫停）
+var int   pauseUntil   = -1       // 連虧暫停到這根K棒為止
 var int   lastClosed   = 0
 var float lastNet      = 0.0
 var int   lastLongBar  = -1000000
@@ -361,6 +383,10 @@ if newDay
 if strategy.position_size == 0 and strategy.closedtrades > lastClosed
     float pnl = strategy.netprofit - lastNet
     lossStreak := pnl < 0 ? lossStreak + 1 : 0
+    lossRun    := pnl < 0 ? lossRun + 1 : 0
+    if usePause and lossRun >= pauseLoss
+        pauseUntil := bar_index + pauseBars
+        lossRun    := 0
     lastClosed := strategy.closedtrades
     lastNet    := strategy.netprofit
     sDir       := 0
@@ -373,9 +399,10 @@ if strategy.position_size != 0 and sDir != 0
         float tr = sPeak - sDir * trailAtr * atr
         sStop := sDir == 1 ? math.max(sStop, tr) : math.min(sStop, tr)
 
-// ③ 訊號（與 trend_signals.pine 相同）：空手、今日未達連虧上限、同方向間隔足夠
+// ③ 訊號（與 trend_signals.pine 相同）：空手、今日未達連虧上限、不在連虧暫停中、同方向間隔足夠
 bool locked   = lossStreak >= maxLoss
-bool canTrade = canSig and sDir == 0 and strategy.position_size == 0 and not locked and atr > 0
+bool paused   = bar_index <= pauseUntil
+bool canTrade = canSig and sDir == 0 and strategy.position_size == 0 and not locked and not paused and atr > 0
 bool sigL     = canTrade and setupL and bar_index - lastLongBar > coolBars
 bool sigS     = canTrade and setupS and bar_index - lastShortBar > coolBars
 
@@ -417,3 +444,5 @@ plot(sDir != 0 and not sTp1Done ? sTp1 : na, "停利 1", color = tpCol, style = 
 plot(sDir != 0 and useTp2 ? sTp2 : na, "停利 2", color = tpCol, style = plot.style_linebr, linewidth = 2)
 plot(ltScore, "長線分數", display = display.data_window)
 plot(lossStreak, "今日連虧", display = display.data_window)
+plot(rangePos, "區間位置 %", display = display.data_window)
+bgcolor(paused ? color.new(color.gray, 85) : na, title = "連虧暫停")
