@@ -8,7 +8,10 @@ strategy("4H 趨勢突破策略", shorttitle = "4H 突破策略", overlay = true
 //  • 訊號在K棒收盤確認，並以該根收盤價成交（process_orders_on_close），與指標的進場價一致
 //  • 方向：日線 EMA50 > EMA200 只做多；EMA50 < EMA200 只做空（lookahead 關閉、只用已收盤日K）
 //  • 進場：收盤突破前 20 根K棒最高點（做空：跌破最低點），且成交量 > 20 根均量
-//  • 出場：初始停損 2 ATR → 3 ATR 移動停損，不設固定停利；日線方向反轉時收盤平倉
+//  • 出場模式（三選一，預設固定止盈）；初始停損都是 2 ATR，日線方向反轉時收盤平倉
+//    - 移動停損：3 ATR 移動停損（只往有利方向移動），不設止盈
+//    - 固定止盈：停損固定，止盈 = 進場價 ± 3 倍停損距離
+//    - 分批：到 2R 先出一半，剩下用 3 ATR 移動停損
 //  • 一次只持有一筆；倉位 = 權益 × 風險% ÷ 停損距離，槓桿上限 3 倍
 // ════════════════════════════════════════════════════════════════════
 
@@ -17,6 +20,10 @@ const string G_TR  = "① 日線趨勢"
 const string G_IN  = "② 突破進場"
 const string G_RK  = "③ 停損 / 倉位"
 const string G_STY = "④ 外觀"
+
+const string EX_TRAIL = "移動停損"
+const string EX_TP    = "固定止盈"
+const string EX_SPLIT = "分批"
 
 string tfD       = input.timeframe("D", "日線週期", group = G_TR)
 int    dFastLen  = input.int(50, "日線 EMA 快線", minval = 1, inline = "d", group = G_TR)
@@ -29,12 +36,17 @@ float  volMult   = input.float(1.0, "成交量倍數", minval = 0, step = 0.1, g
 int    atrLen    = input.int(14, "ATR 週期", minval = 1, group = G_RK)
 float  slAtr     = input.float(2.0, "初始停損 (ATR 倍數)", minval = 0.1, step = 0.1, group = G_RK)
 float  trailAtr  = input.float(3.0, "移動停損 (ATR 倍數)", minval = 0.1, step = 0.1, group = G_RK, tooltip = "持倉期間最高價（做空：最低價）回落 ATR × 此值。停損只會往有利方向移動，且不會比初始停損更遠。")
+string exitMode  = input.string(EX_TP, "出場模式", options = [EX_TRAIL, EX_TP, EX_SPLIT], group = G_RK, tooltip = "移動停損：3 ATR 移動停損、不設止盈。固定止盈：停損固定在初始停損，止盈 = 進場價 ± N 倍停損距離。分批：到第一段止盈先出一部分，剩下用移動停損。")
+float  tpR       = input.float(3.0, "固定止盈：N 倍停損距離", minval = 0.1, step = 0.5, group = G_RK)
+float  splitR    = input.float(2.0, "分批：第一段止盈 (R 倍數)", minval = 0.1, step = 0.5, group = G_RK)
+float  splitPct  = input.float(50.0, "分批：第一段出場比例 %", minval = 1, maxval = 100, group = G_RK)
 float  riskPct   = input.float(2.0, "每筆風險 %（權益）", minval = 0.1, step = 0.5, group = G_RK, tooltip = "以目前策略權益計算（會隨盈虧複利）。")
 float  maxLev    = input.float(3.0, "槓桿上限", minval = 1, step = 0.5, group = G_RK, tooltip = "依風險算出的倉位超過此槓桿時，倉位縮到上限，實際風險會小於設定。")
 
 color  bullCol   = input.color(#00c853, "做多", inline = "c1", group = G_STY)
 color  bearCol   = input.color(#ff1744, "做空", inline = "c1", group = G_STY)
-color  slCol     = input.color(#f23645, "移動停損線", inline = "c1", group = G_STY)
+color  slCol     = input.color(#f23645, "停損線", inline = "c2", group = G_STY)
+color  tpCol     = input.color(#089981, "止盈線", inline = "c2", group = G_STY)
 string sigSizeIn = input.string("大", "訊號文字大小", options = ["小", "中", "大", "特大"], group = G_STY)
 string tblSizeIn = input.string("中", "表格文字大小", options = ["小", "中", "大", "特大"], group = G_STY)
 
@@ -81,10 +93,15 @@ bool  brkDn  = close < loN
 bool  canSig = barstate.isconfirmed
 
 // ─────────────────────────── 下單與出場 ───────────────────────────
+bool  useTp    = exitMode != EX_TRAIL                         // 有止盈單：固定止盈 / 分批第一段
+float tpMult   = exitMode == EX_SPLIT ? splitR : tpR          // 止盈 = 進場價 ± 倍數 × 停損距離
+
 var int    sDir     = 0       // 1 = 做多中，-1 = 做空中，0 = 觀望
 var float  sEntry   = na
 var float  sInitSL  = na
-var float  sStop    = na      // 目前停損（移動停損）
+var float  sStop    = na      // 目前停損（移動停損模式會移動）
+var float  sTp      = na
+var bool   sTpDone  = false   // 分批第一段已成交
 var float  sPeak    = na
 var float  sRiskAmt = na      // 1R 的金額 = 數量 × 停損距離
 var float  sRisk    = na      // 1R 的價格距離
@@ -96,34 +113,44 @@ var float  lastNet    = 0.0
 var string lastRes    = ""
 var int    exitBar    = -1
 
-bool exitNow = false
+string baseCcy = syminfo.basecurrency != "" ? syminfo.basecurrency : "單位"
 
-// ① 部位已出場（停損 / 移動停損 / 趨勢反轉）→ 依淨損益（含手續費、滑價）標示 R
+// 止盈說明（表格、警報共用）
+tpText(float tp) =>
+    exitMode == EX_TRAIL ? "無（移動停損出場）" : exitMode == EX_TP ? fmt(tp) + "（" + str.tostring(tpR) + "R）" : fmt(tp) + "（" + str.tostring(splitR) + "R 出 " + str.tostring(splitPct) + "%，剩餘移動停損）"
+
+// 做多 / 做空警報內容：收到就能直接下單
+entryMsg(int d, float entry, float sl, float tp, float qty, float lev) =>
+    syminfo.ticker + " " + timeframe.period + "：" + (d == 1 ? "▲ 做多" : "▼ 做空") + "\n進場價 " + fmt(entry) + "\n停損價 " + fmt(sl) + "\n止盈價 " + tpText(tp) + "\n建議倉位 " + str.tostring(qty, "#.####") + " " + baseCcy + "（≈ " + str.tostring(qty * entry, "#,##0") + " " + syminfo.currency + "，槓桿 " + str.tostring(lev, "0.0") + "x）"
+
+// ① 部位已全部出場 → 依整筆（含分批）的淨損益（含手續費、滑價）標示 R
 if strategy.position_size == 0 and strategy.closedtrades > lastClosed
     int    n   = strategy.closedtrades - 1
     int    xb  = strategy.closedtrades.exit_bar_index(n)
     float  xp  = strategy.closedtrades.exit_price(n)
     float  r   = (strategy.netprofit - lastNet) / sRiskAmt
     string why = strategy.closedtrades.exit_comment(n)
-    lastRes    := (strategy.closedtrades.size(n) > 0 ? "做多 " : "做空 ") + why + " " + fmtR(r)
+    bool   up  = strategy.closedtrades.size(n) > 0
+    lastRes    := (up ? "做多 " : "做空 ") + why + " " + fmtR(r)
     lastClosed := strategy.closedtrades
     lastNet    := strategy.netprofit
     exitBar    := xb
     sDir       := 0
-    bool up = strategy.closedtrades.size(n) > 0
     label.new(xb, up ? high[bar_index - xb] : low[bar_index - xb], "出場 " + fmtR(r), yloc = up ? yloc.abovebar : yloc.belowbar, style = up ? label.style_label_down : label.style_label_up, color = color.new(r >= 0 ? bullCol : bearCol, 25), textcolor = color.white, size = size.normal, tooltip = why + " " + fmt(xp))
     if xb == bar_index
-        exitNow := true
-        alert(syminfo.ticker + " " + timeframe.period + "：出場（" + why + "）" + fmt(xp), alert.freq_once_per_bar_close)
+        alert(syminfo.ticker + " " + timeframe.period + "：出場（" + why + "）" + fmt(xp) + "，" + lastRes, alert.freq_once_per_bar_close)
 
-// ② 持倉中：收盤後更新移動停損（最高價 / 最低價回落 3 ATR，只往有利方向移動）；日線方向反轉 → 收盤平倉
+// ② 持倉中：還有部位但已有平倉紀錄 = 分批第一段已成交；更新移動停損；日線方向反轉 → 收盤平倉
 if sDir != 0 and strategy.position_size != 0
+    if exitMode == EX_SPLIT and not sTpDone and strategy.closedtrades > lastClosed
+        sTpDone := true
+        alert(syminfo.ticker + " " + timeframe.period + "：分批止盈 " + str.tostring(splitPct) + "%，價格 " + fmt(sTp) + "，剩餘部位改用移動停損", alert.freq_once_per_bar_close)
     sPeak := sDir == 1 ? math.max(sPeak, high) : math.min(sPeak, low)
-    float tr = sPeak - sDir * trailAtr * atr
-    sStop := sDir == 1 ? math.max(sStop, tr) : math.min(sStop, tr)
+    if exitMode == EX_TRAIL or (exitMode == EX_SPLIT and sTpDone)
+        float tr = sPeak - sDir * trailAtr * atr
+        sStop := sDir == 1 ? math.max(sStop, tr) : math.min(sStop, tr)
     if canSig and sDir * (close - sStop) > 0 and dDir == -sDir
         strategy.close(sDir == 1 ? "做多" : "做空", comment = "趨勢反轉")
-        exitNow := true
         alert(syminfo.ticker + " " + timeframe.period + "：出場（趨勢反轉）" + fmt(close), alert.freq_once_per_bar_close)
         sDir := 0
 
@@ -132,7 +159,6 @@ bool canEnter = canSig and sDir == 0 and strategy.position_size == 0 and bar_ind
 bool sigL     = canEnter and dDir == 1 and brkUp and volOK
 bool sigS     = canEnter and dDir == -1 and brkDn and volOK
 
-string baseCcy = syminfo.basecurrency != "" ? syminfo.basecurrency : "單位"
 if sigL or sigS
     int   d    = sigL ? 1 : -1
     float dist = slAtr * atr
@@ -146,26 +172,34 @@ if sigL or sigS
     sRisk    := dist
     sInitSL  := close - d * dist
     sStop    := sInitSL
+    sTp      := close + d * tpMult * dist
+    sTpDone  := false
     sPeak    := close
     sQty     := q
     sLev     := q * close / eq
     sRiskAmt := q * dist
     sRealRk  := sRiskAmt / eq * 100
     string txt = d == 1 ? "▲ 做多" : "▼ 做空"
-    string msg = syminfo.ticker + " " + timeframe.period + "：" + txt + "\n進場 " + fmt(close) + "\n初始停損 " + fmt(sInitSL) + "\n數量 " + str.tostring(q, "#.####") + "，槓桿 " + str.tostring(sLev, "0.0") + "x"
+    string msg = entryMsg(d, sEntry, sInitSL, sTp, sQty, sLev)
     strategy.entry(d == 1 ? "做多" : "做空", d == 1 ? strategy.long : strategy.short, qty = q, comment = txt, alert_message = msg)
     alert(msg, alert.freq_once_per_bar_close)
     label.new(bar_index, d == 1 ? low : high, txt, yloc = d == 1 ? yloc.belowbar : yloc.abovebar, style = d == 1 ? label.style_label_up : label.style_label_down, color = d == 1 ? bullCol : bearCol, textcolor = color.white, size = toSize(sigSizeIn), tooltip = msg, text_formatting = text.format_bold)
 
-// ④ 停損單：每根K棒更新為目前的移動停損
+// ④ 出場單：每根K棒更新停損價
+//    固定止盈：停損 + 止盈；分批：第一段（止盈 + 停損）+ 剩餘部位（停損 / 移動停損）；移動停損：只有停損
 if sDir != 0
-    strategy.exit("出場", sDir == 1 ? "做多" : "做空", stop = sStop, comment = sStop != sInitSL ? "移動停損" : "停損")
+    string eid    = sDir == 1 ? "做多" : "做空"
+    string stopNm = sStop != sInitSL ? "移動停損" : "停損"
+    if exitMode == EX_SPLIT and not sTpDone
+        strategy.exit("分批止盈", eid, qty_percent = splitPct, limit = sTp, stop = sStop, comment_profit = "分批止盈", comment_loss = stopNm)
+    strategy.exit("出場", eid, limit = exitMode == EX_TP ? sTp : na, stop = sStop, comment_profit = "止盈", comment_loss = stopNm)
 
-// 目前的移動停損線
-plot(sDir != 0 ? sStop : na, "移動停損", color = slCol, style = plot.style_linebr, linewidth = 2)
+// 目前的停損線 / 止盈線
+plot(sDir != 0 ? sStop : na, "停損", color = slCol, style = plot.style_linebr, linewidth = 2)
+plot(sDir != 0 and useTp and not sTpDone ? sTp : na, "止盈", color = tpCol, style = plot.style_linebr, linewidth = 2)
 
 // ─────────────────────────── 右上角表格 ───────────────────────────
-var table tb = table.new(position.top_right, 2, 8, bgcolor = color.new(#131722, 15), frame_color = color.new(#787b86, 40), frame_width = 1, border_color = color.new(#787b86, 75), border_width = 1)
+var table tb = table.new(position.top_right, 2, 9, bgcolor = color.new(#131722, 15), frame_color = color.new(#787b86, 40), frame_width = 1, border_color = color.new(#787b86, 75), border_width = 1)
 
 dirColor(int d) =>
     d == 1 ? bullCol : d == -1 ? bearCol : color.silver
@@ -177,13 +211,15 @@ setRow(int r, string k, string v, color c) =>
 
 if barstate.islast
     bool live = sDir != 0
-    setRow(0, "4H 趨勢突破策略", syminfo.ticker + " · " + timeframe.period, color.white)
+    setRow(0, "4H 趨勢突破策略", syminfo.ticker + " · " + timeframe.period + " · " + exitMode, color.white)
     string dTxt = not dReady ? "資料不足" : (dDir == 1 ? "多頭（只做多）" : dDir == -1 ? "空頭（只做空）" : "持平") + "　EMA" + str.tostring(dFastLen) + " " + fmt(dFast) + " / EMA" + str.tostring(dSlowLen) + " " + fmt(dSlow)
     setRow(1, "日線趨勢", dTxt, dirColor(dDir))
-    string posTxt = live ? (sDir == 1 ? "▲ 做多" : "▼ 做空") + "（浮動 " + fmtR(sDir * (close - sEntry) / sRisk) + "）" : "觀望"
+    string posTxt = live ? (sDir == 1 ? "▲ 做多" : "▼ 做空") + "（浮動 " + fmtR(strategy.openprofit / sRiskAmt) + "）" : "觀望"
     setRow(2, "目前持倉", posTxt, dirColor(sDir))
     setRow(3, "進場價", live ? fmt(sEntry) : "觀望", color.white)
-    setRow(4, "移動停損", live ? fmt(sStop) + (sStop != sInitSL ? "" : "（初始停損）") : "觀望", slCol)
-    setRow(5, "建議倉位", live ? str.tostring(sQty, "#.####") + " " + baseCcy + "（≈ " + str.tostring(sQty * sEntry, "#,##0") + " " + syminfo.currency + "）" : "觀望", color.white)
-    setRow(6, "建議槓桿", live ? str.tostring(sLev, "0.0") + "x（上限 " + str.tostring(maxLev) + "x，風險 " + str.tostring(sRealRk, "0.0") + "%）" : "觀望", color.white)
-    setRow(7, "上一筆", lastRes != "" ? lastRes : "—", color.silver)
+    setRow(4, "停損", live ? fmt(sStop) + (sStop != sInitSL ? "（移動停損）" : "（初始停損）") : "觀望", slCol)
+    string tpTxt = not live ? "觀望" : exitMode == EX_SPLIT and sTpDone ? "已出 " + str.tostring(splitPct) + "%，剩餘移動停損" : tpText(sTp)
+    setRow(5, "止盈", tpTxt, tpCol)
+    setRow(6, "建議倉位", live ? str.tostring(sQty, "#.####") + " " + baseCcy + "（≈ " + str.tostring(sQty * sEntry, "#,##0") + " " + syminfo.currency + "）" : "觀望", color.white)
+    setRow(7, "建議槓桿", live ? str.tostring(sLev, "0.0") + "x（上限 " + str.tostring(maxLev) + "x，風險 " + str.tostring(sRealRk, "0.0") + "%）" : "觀望", color.white)
+    setRow(8, "上一筆", lastRes != "" ? lastRes : "—", color.silver)
