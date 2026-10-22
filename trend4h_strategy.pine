@@ -1,0 +1,189 @@
+//@version=6
+strategy("4H 趨勢突破策略", shorttitle = "4H 突破策略", overlay = true, initial_capital = 10000, currency = currency.USDT, commission_type = strategy.commission.percent, commission_value = 0.05, slippage = 2, pyramiding = 0, margin_long = 10, margin_short = 10, process_orders_on_close = true, max_labels_count = 500)
+
+// ════════════════════════════════════════════════════════════════════
+//  4H 趨勢突破策略 —— trend4h_signals.pine 的回測版（規則完全相同）
+//  • 初始資金 10000 USDT，手續費每邊 0.05%，滑價 2 tick
+//  • 保證金比例設 10%（回測最多允許 10 倍），實際槓桿由「槓桿上限」控制（預設 3 倍），不會誤判斷頭
+//  • 訊號在K棒收盤確認，並以該根收盤價成交（process_orders_on_close），與指標的進場價一致
+//  • 方向：日線 EMA50 > EMA200 只做多；EMA50 < EMA200 只做空（lookahead 關閉、只用已收盤日K）
+//  • 進場：收盤突破前 20 根K棒最高點（做空：跌破最低點），且成交量 > 20 根均量
+//  • 出場：初始停損 2 ATR → 3 ATR 移動停損，不設固定停利；日線方向反轉時收盤平倉
+//  • 一次只持有一筆；倉位 = 權益 × 風險% ÷ 停損距離，槓桿上限 3 倍
+// ════════════════════════════════════════════════════════════════════
+
+// ───────────────────────────── 輸入 ─────────────────────────────
+const string G_TR  = "① 日線趨勢"
+const string G_IN  = "② 突破進場"
+const string G_RK  = "③ 停損 / 倉位"
+const string G_STY = "④ 外觀"
+
+string tfD       = input.timeframe("D", "日線週期", group = G_TR)
+int    dFastLen  = input.int(50, "日線 EMA 快線", minval = 1, inline = "d", group = G_TR)
+int    dSlowLen  = input.int(200, "慢線", minval = 1, inline = "d", group = G_TR)
+
+int    brkLen    = input.int(20, "突破回看K棒數", minval = 1, group = G_IN, tooltip = "收盤價突破前 N 根K棒（不含本根）的最高點做多、跌破最低點做空。")
+int    volLen    = input.int(20, "均量週期", minval = 1, group = G_IN)
+float  volMult   = input.float(1.0, "成交量倍數", minval = 0, step = 0.1, group = G_IN, tooltip = "突破K棒的成交量 > 均量 × 此倍數。")
+
+int    atrLen    = input.int(14, "ATR 週期", minval = 1, group = G_RK)
+float  slAtr     = input.float(2.0, "初始停損 (ATR 倍數)", minval = 0.1, step = 0.1, group = G_RK)
+float  trailAtr  = input.float(3.0, "移動停損 (ATR 倍數)", minval = 0.1, step = 0.1, group = G_RK, tooltip = "持倉期間最高價（做空：最低價）回落 ATR × 此值。停損只會往有利方向移動，且不會比初始停損更遠。")
+float  riskPct   = input.float(2.0, "每筆風險 %（權益）", minval = 0.1, step = 0.5, group = G_RK, tooltip = "以目前策略權益計算（會隨盈虧複利）。")
+float  maxLev    = input.float(3.0, "槓桿上限", minval = 1, step = 0.5, group = G_RK, tooltip = "依風險算出的倉位超過此槓桿時，倉位縮到上限，實際風險會小於設定。")
+
+color  bullCol   = input.color(#00c853, "做多", inline = "c1", group = G_STY)
+color  bearCol   = input.color(#ff1744, "做空", inline = "c1", group = G_STY)
+color  slCol     = input.color(#f23645, "移動停損線", inline = "c1", group = G_STY)
+string sigSizeIn = input.string("大", "訊號文字大小", options = ["小", "中", "大", "特大"], group = G_STY)
+string tblSizeIn = input.string("中", "表格文字大小", options = ["小", "中", "大", "特大"], group = G_STY)
+
+// ─────────────────────────── 函式 ───────────────────────────
+toSize(string s) =>
+    switch s
+        "小" => size.small
+        "中" => size.normal
+        "大" => size.large
+        => size.huge
+
+fmt(float p) =>
+    str.tostring(p, format.mintick)
+
+fmtR(float r) =>
+    (r >= 0 ? "+" : "") + str.tostring(r, "0.0") + "R"
+
+// 在日線資料上計算 [快線 EMA, 慢線 EMA]；搭配 lookahead 關閉，只拿「已收盤」的日K（與 trend_signals.pine 相同做法）：
+//  • 歷史K棒：日K收盤的那一根才換新值，呼叫端再往前取一根 → 整天都是前一根已收盤的日K
+//  • 即時K棒：在日線這邊直接取前一根 → 同樣是前一根已收盤的日K
+dailyCalc(simple int fastLen, simple int slowLen) =>
+    int   o  = barstate.isrealtime ? 1 : 0
+    float ef = ta.ema(close, fastLen)
+    float es = ta.ema(close, slowLen)
+    [ef[o], es[o]]
+
+// ─────────────────────────── 日線趨勢 ───────────────────────────
+[dE, dS] = request.security(syminfo.tickerid, tfD, dailyCalc(dFastLen, dSlowLen), lookahead = barmerge.lookahead_off)
+int   ro     = barstate.isrealtime ? 0 : 1
+float dFast  = dE[ro]
+float dSlow  = dS[ro]
+bool  dReady = not na(dFast) and not na(dSlow)
+int   dDir   = not dReady ? 0 : dFast > dSlow ? 1 : dFast < dSlow ? -1 : 0
+
+// ─────────────────────────── 突破條件 ───────────────────────────
+float atr    = ta.atr(atrLen)
+float hiN    = ta.highest(high, brkLen)[1]    // 前 N 根（不含本根）最高點
+float loN    = ta.lowest(low, brkLen)[1]
+float vol    = nz(volume)
+float volMA  = ta.sma(vol, volLen)
+bool  volOK  = volMA > 0 and vol > volMA * volMult
+bool  brkUp  = close > hiN
+bool  brkDn  = close < loN
+bool  canSig = barstate.isconfirmed
+
+// ─────────────────────────── 下單與出場 ───────────────────────────
+var int    sDir     = 0       // 1 = 做多中，-1 = 做空中，0 = 觀望
+var float  sEntry   = na
+var float  sInitSL  = na
+var float  sStop    = na      // 目前停損（移動停損）
+var float  sPeak    = na
+var float  sRiskAmt = na      // 1R 的金額 = 數量 × 停損距離
+var float  sRisk    = na      // 1R 的價格距離
+var float  sQty     = na
+var float  sLev     = na
+var float  sRealRk  = na
+var int    lastClosed = 0
+var float  lastNet    = 0.0
+var string lastRes    = ""
+var int    exitBar    = -1
+
+bool exitNow = false
+
+// ① 部位已出場（停損 / 移動停損 / 趨勢反轉）→ 依淨損益（含手續費、滑價）標示 R
+if strategy.position_size == 0 and strategy.closedtrades > lastClosed
+    int    n   = strategy.closedtrades - 1
+    int    xb  = strategy.closedtrades.exit_bar_index(n)
+    float  xp  = strategy.closedtrades.exit_price(n)
+    float  r   = (strategy.netprofit - lastNet) / sRiskAmt
+    string why = strategy.closedtrades.exit_comment(n)
+    lastRes    := (strategy.closedtrades.size(n) > 0 ? "做多 " : "做空 ") + why + " " + fmtR(r)
+    lastClosed := strategy.closedtrades
+    lastNet    := strategy.netprofit
+    exitBar    := xb
+    sDir       := 0
+    bool up = strategy.closedtrades.size(n) > 0
+    label.new(xb, up ? high[bar_index - xb] : low[bar_index - xb], "出場 " + fmtR(r), yloc = up ? yloc.abovebar : yloc.belowbar, style = up ? label.style_label_down : label.style_label_up, color = color.new(r >= 0 ? bullCol : bearCol, 25), textcolor = color.white, size = size.normal, tooltip = why + " " + fmt(xp))
+    if xb == bar_index
+        exitNow := true
+        alert(syminfo.ticker + " " + timeframe.period + "：出場（" + why + "）" + fmt(xp), alert.freq_once_per_bar_close)
+
+// ② 持倉中：收盤後更新移動停損（最高價 / 最低價回落 3 ATR，只往有利方向移動）；日線方向反轉 → 收盤平倉
+if sDir != 0 and strategy.position_size != 0
+    sPeak := sDir == 1 ? math.max(sPeak, high) : math.min(sPeak, low)
+    float tr = sPeak - sDir * trailAtr * atr
+    sStop := sDir == 1 ? math.max(sStop, tr) : math.min(sStop, tr)
+    if canSig and sDir * (close - sStop) > 0 and dDir == -sDir
+        strategy.close(sDir == 1 ? "做多" : "做空", comment = "趨勢反轉")
+        exitNow := true
+        alert(syminfo.ticker + " " + timeframe.period + "：出場（趨勢反轉）" + fmt(close), alert.freq_once_per_bar_close)
+        sDir := 0
+
+// ③ 進場：觀望中、出場那根K棒不再進場
+bool canEnter = canSig and sDir == 0 and strategy.position_size == 0 and bar_index != exitBar and atr > 0
+bool sigL     = canEnter and dDir == 1 and brkUp and volOK
+bool sigS     = canEnter and dDir == -1 and brkDn and volOK
+
+string baseCcy = syminfo.basecurrency != "" ? syminfo.basecurrency : "單位"
+if sigL or sigS
+    int   d    = sigL ? 1 : -1
+    float dist = slAtr * atr
+    float eq   = strategy.equity
+    // 倉位 = 權益 × 風險% ÷ 停損距離；超過槓桿上限就縮到上限
+    float q    = eq * riskPct / 100 / dist
+    if q * close / eq > maxLev
+        q := eq * maxLev / close
+    sDir     := d
+    sEntry   := close
+    sRisk    := dist
+    sInitSL  := close - d * dist
+    sStop    := sInitSL
+    sPeak    := close
+    sQty     := q
+    sLev     := q * close / eq
+    sRiskAmt := q * dist
+    sRealRk  := sRiskAmt / eq * 100
+    string txt = d == 1 ? "▲ 做多" : "▼ 做空"
+    string msg = syminfo.ticker + " " + timeframe.period + "：" + txt + "\n進場 " + fmt(close) + "\n初始停損 " + fmt(sInitSL) + "\n數量 " + str.tostring(q, "#.####") + "，槓桿 " + str.tostring(sLev, "0.0") + "x"
+    strategy.entry(d == 1 ? "做多" : "做空", d == 1 ? strategy.long : strategy.short, qty = q, comment = txt, alert_message = msg)
+    alert(msg, alert.freq_once_per_bar_close)
+    label.new(bar_index, d == 1 ? low : high, txt, yloc = d == 1 ? yloc.belowbar : yloc.abovebar, style = d == 1 ? label.style_label_up : label.style_label_down, color = d == 1 ? bullCol : bearCol, textcolor = color.white, size = toSize(sigSizeIn), tooltip = msg, text_formatting = text.format_bold)
+
+// ④ 停損單：每根K棒更新為目前的移動停損
+if sDir != 0
+    strategy.exit("出場", sDir == 1 ? "做多" : "做空", stop = sStop, comment = sStop != sInitSL ? "移動停損" : "停損")
+
+// 目前的移動停損線
+plot(sDir != 0 ? sStop : na, "移動停損", color = slCol, style = plot.style_linebr, linewidth = 2)
+
+// ─────────────────────────── 右上角表格 ───────────────────────────
+var table tb = table.new(position.top_right, 2, 8, bgcolor = color.new(#131722, 15), frame_color = color.new(#787b86, 40), frame_width = 1, border_color = color.new(#787b86, 75), border_width = 1)
+
+dirColor(int d) =>
+    d == 1 ? bullCol : d == -1 ? bearCol : color.silver
+
+setRow(int r, string k, string v, color c) =>
+    string sz = toSize(tblSizeIn)
+    tb.cell(0, r, k, text_color = color.white, text_halign = text.align_left, text_size = sz)
+    tb.cell(1, r, v, text_color = c, text_halign = text.align_left, text_size = sz)
+
+if barstate.islast
+    bool live = sDir != 0
+    setRow(0, "4H 趨勢突破策略", syminfo.ticker + " · " + timeframe.period, color.white)
+    string dTxt = not dReady ? "資料不足" : (dDir == 1 ? "多頭（只做多）" : dDir == -1 ? "空頭（只做空）" : "持平") + "　EMA" + str.tostring(dFastLen) + " " + fmt(dFast) + " / EMA" + str.tostring(dSlowLen) + " " + fmt(dSlow)
+    setRow(1, "日線趨勢", dTxt, dirColor(dDir))
+    string posTxt = live ? (sDir == 1 ? "▲ 做多" : "▼ 做空") + "（浮動 " + fmtR(sDir * (close - sEntry) / sRisk) + "）" : "觀望"
+    setRow(2, "目前持倉", posTxt, dirColor(sDir))
+    setRow(3, "進場價", live ? fmt(sEntry) : "觀望", color.white)
+    setRow(4, "移動停損", live ? fmt(sStop) + (sStop != sInitSL ? "" : "（初始停損）") : "觀望", slCol)
+    setRow(5, "建議倉位", live ? str.tostring(sQty, "#.####") + " " + baseCcy + "（≈ " + str.tostring(sQty * sEntry, "#,##0") + " " + syminfo.currency + "）" : "觀望", color.white)
+    setRow(6, "建議槓桿", live ? str.tostring(sLev, "0.0") + "x（上限 " + str.tostring(maxLev) + "x，風險 " + str.tostring(sRealRk, "0.0") + "%）" : "觀望", color.white)
+    setRow(7, "上一筆", lastRes != "" ? lastRes : "—", color.silver)
