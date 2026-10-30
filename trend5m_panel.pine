@@ -1,0 +1,335 @@
+//@version=6
+indicator("5分看盤輔助", shorttitle = "5分看盤", overlay = true, max_lines_count = 50, max_boxes_count = 50, max_labels_count = 50)
+
+// ════════════════════════════════════════════════════════════════════
+//  5分看盤輔助 —— 多週期趨勢 + 支撐壓力 + 當日參考價位（5 分鐘圖用）
+//  • 多週期趨勢：5 分、15 分、1 小時、4 小時
+//    EMA20 > EMA50 且收盤在 EMA20 之上 = 多；EMA20 < EMA50 且收盤在 EMA20 之下 = 空；其他 = 盤整
+//    （request.security lookahead 關閉，只用已收盤的K棒，不重繪）
+//  • 短線偏向：四個週期中 3 個以上同方向 → 偏多 / 偏空，否則「方向不一致，觀望」
+//  • 4H 策略方向：日線 EMA50 > EMA200 只做多，EMA50 < EMA200 只做空
+//  • 支撐 / 壓力：沿用 support_resistance.pine 的前高前低 + 觸碰次數（強支撐 / 強壓力）
+//  • 當日 VWAP、今日開盤價、前一日高點 / 低點（預設台灣時間 08:00 換日）
+//  • 不畫買賣訊號
+// ════════════════════════════════════════════════════════════════════
+
+// ───────────────────────────── 輸入 ─────────────────────────────
+const string G_TR  = "① 多週期趨勢"
+const string G_DIR = "② 4H 策略方向"
+const string G_LV  = "③ 支撐 / 壓力"
+const string G_DAY = "④ 當日參考價位"
+const string G_STY = "⑤ 外觀"
+
+string tf1       = input.timeframe("5", "週期 1", group = G_TR)
+string tf2       = input.timeframe("15", "週期 2", group = G_TR)
+string tf3       = input.timeframe("60", "週期 3", group = G_TR)
+string tf4       = input.timeframe("240", "週期 4", group = G_TR)
+int    fastLen   = input.int(20, "EMA 快線", minval = 1, inline = "e", group = G_TR)
+int    slowLen   = input.int(50, "慢線", minval = 1, inline = "e", group = G_TR)
+int    biasNeed  = input.int(3, "短線偏向：至少幾個週期同方向", minval = 1, maxval = 4, group = G_TR, tooltip = "四個週期中，同方向（多或空）的數量達到此值才顯示偏多 / 偏空，否則顯示「方向不一致，觀望」。")
+
+string tfD       = input.timeframe("D", "日線週期", group = G_DIR)
+int    dFastLen  = input.int(50, "日線 EMA 快線", minval = 1, inline = "d", group = G_DIR)
+int    dSlowLen  = input.int(200, "慢線", minval = 1, inline = "d", group = G_DIR)
+
+bool   showLv      = input.bool(true, "顯示支撐 / 壓力", group = G_LV)
+int    pivotLen    = input.int(5, "前高 / 前低 左右K棒數", minval = 2, group = G_LV, tooltip = "轉折高點(低點)左右兩側各需幾根K棒比它低(高)。數字越大，價位越少、越重要。")
+int    strongTouch = input.int(3, "強支撐 / 強壓力 觸碰次數", minval = 2, group = G_LV, tooltip = "同一價位被前高 / 前低觸碰達此次數，名稱加上「強」。")
+float  mergeMult   = input.float(1.0, "同一價位合併距離 (ATR 倍數)", minval = 0.1, step = 0.1, group = G_LV, tooltip = "新的前高 / 前低與既有價位距離小於 ATR × 此值，視為同一價位，觸碰次數 +1。")
+float  zoneMult    = input.float(0.3, "區間寬度 (ATR 倍數)", minval = 0.0, step = 0.05, group = G_LV, tooltip = "收盤價超出區間才算突破 / 跌破（壓力轉支撐、支撐轉壓力）。")
+int    perSide     = input.int(3, "上下各顯示幾條", minval = 1, maxval = 10, group = G_LV)
+int    atrLen      = input.int(14, "ATR 週期", minval = 1, group = G_LV)
+string resWord     = input.string("壓力", "上方價位名稱", options = ["壓力", "阻力"], group = G_LV)
+
+string dayTz     = input.string("UTC+8", "換日時區", group = G_DAY, tooltip = "例如 UTC+8（台灣）、UTC、Asia/Taipei。")
+int    dayHour   = input.int(8, "換日時間：時", minval = 0, maxval = 23, inline = "rt", group = G_DAY)
+int    dayMin    = input.int(0, "分", minval = 0, maxval = 59, inline = "rt", group = G_DAY)
+bool   showVwap  = input.bool(true, "當日 VWAP", inline = "vw", group = G_DAY)
+float  vwapSrc   = input.source(hlc3, "來源", inline = "vw", group = G_DAY)
+bool   showOpen  = input.bool(true, "今日開盤價", group = G_DAY)
+bool   showPdhl  = input.bool(true, "前一日高點 / 低點", group = G_DAY)
+
+color  bullCol   = input.color(#00c853, "多", inline = "c1", group = G_STY)
+color  bearCol   = input.color(#ff1744, "空", inline = "c1", group = G_STY)
+color  flatCol   = input.color(#b2b5be, "盤整 / 觀望", inline = "c1", group = G_STY)
+color  supCol    = input.color(#089981, "支撐", inline = "c2", group = G_STY)
+color  resCol    = input.color(#f23645, "壓力", inline = "c2", group = G_STY)
+color  vwapCol   = input.color(#ff9800, "VWAP", inline = "c3", group = G_STY)
+color  openCol   = input.color(#2962ff, "今日開盤", inline = "c3", group = G_STY)
+color  pdhCol    = input.color(#e040fb, "前日高", inline = "c4", group = G_STY)
+color  pdlCol    = input.color(#00bcd4, "前日低", inline = "c4", group = G_STY)
+bool   showBg    = input.bool(true, "背景顯示短線偏向", group = G_STY, tooltip = "偏多淡綠、偏空淡紅、觀望不上色。")
+int    bgTransp  = input.int(90, "背景透明度", minval = 0, maxval = 100, group = G_STY)
+string tblPosIn  = input.string("右上", "表格位置", options = ["右上", "右下", "左上", "左下"], group = G_STY)
+string tblSizeIn = input.string("中", "表格文字大小", options = ["小", "中", "大", "特大"], group = G_STY)
+string lvSizeIn  = input.string("中", "價位文字大小", options = ["小", "中", "大", "特大"], group = G_STY)
+bool   showPrice = input.bool(true, "價位標籤顯示價格", group = G_STY)
+bool   showZone  = input.bool(true, "支撐 / 壓力 區間底色", group = G_STY)
+int    lblOffset = input.int(5, "支撐 / 壓力 標籤右移K棒數", minval = 0, maxval = 100, group = G_STY)
+int    refOffset = input.int(1, "當日價位標籤右移K棒數", minval = 0, maxval = 100, group = G_STY)
+
+// ─────────────────────────── 型別與函式 ───────────────────────────
+type Level
+    float price
+    int   touches = 1
+    bool  isRes   = false
+    int   startBar
+    int   lastBar
+
+toSize(string s) =>
+    switch s
+        "小" => size.small
+        "中" => size.normal
+        "大" => size.large
+        => size.huge
+
+toPos(string s) =>
+    switch s
+        "右上" => position.top_right
+        "右下" => position.bottom_right
+        "左上" => position.top_left
+        => position.bottom_left
+
+fmt(float p) =>
+    str.tostring(p, format.mintick)
+
+// 週期名稱：5 → 5 分、60 → 1 小時、240 → 4 小時、D → 日線
+tfName(string tf) =>
+    int s = timeframe.in_seconds(tf)
+    s < 60 ? str.tostring(s) + " 秒" : s < 3600 ? str.tostring(s / 60) + " 分" : s < 86400 ? str.tostring(s / 3600) + " 小時" : s == 86400 ? "日線" : s == 604800 ? "週線" : tf
+
+dirColor(int d) =>
+    na(d) ? flatCol : d == 1 ? bullCol : d == -1 ? bearCol : flatCol
+
+// 在指定週期上計算 [快線 EMA, 慢線 EMA, 收盤]；搭配 lookahead 關閉，只拿「已收盤」的K棒（與 trend4h_signals.pine 相同做法）：
+//  • 歷史K棒：高週期K棒收盤的那一根才換新值，呼叫端再往前取一根 → 一律是前一根已收盤的高週期K棒
+//  • 即時K棒：在高週期這邊直接取前一根 → 同樣是前一根已收盤的高週期K棒
+htfCalc(simple int fLen, simple int sLen) =>
+    int   o  = barstate.isrealtime ? 1 : 0
+    float ef = ta.ema(close, fLen)
+    float es = ta.ema(close, sLen)
+    [ef[o], es[o], close[o]]
+
+// 多 = 1、空 = -1、盤整 = 0、資料不足 = na
+trendDir(float ef, float es, float c) =>
+    int d = na
+    if not (na(ef) or na(es) or na(c))
+        d := ef > es and c > ef ? 1 : ef < es and c < ef ? -1 : 0
+    d
+
+trendText(int d) =>
+    na(d) ? "資料不足" : d == 1 ? "多" : d == -1 ? "空" : "盤整"
+
+// ─────────────────────────── 多週期趨勢 ───────────────────────────
+int ro = barstate.isrealtime ? 0 : 1
+
+[f1, s1, c1] = request.security(syminfo.tickerid, tf1, htfCalc(fastLen, slowLen), lookahead = barmerge.lookahead_off)
+[f2, s2, c2] = request.security(syminfo.tickerid, tf2, htfCalc(fastLen, slowLen), lookahead = barmerge.lookahead_off)
+[f3, s3, c3] = request.security(syminfo.tickerid, tf3, htfCalc(fastLen, slowLen), lookahead = barmerge.lookahead_off)
+[f4, s4, c4] = request.security(syminfo.tickerid, tf4, htfCalc(fastLen, slowLen), lookahead = barmerge.lookahead_off)
+[dF, dS, dC] = request.security(syminfo.tickerid, tfD, htfCalc(dFastLen, dSlowLen), lookahead = barmerge.lookahead_off)
+
+int d1 = trendDir(f1[ro], s1[ro], c1[ro])
+int d2 = trendDir(f2[ro], s2[ro], c2[ro])
+int d3 = trendDir(f3[ro], s3[ro], c3[ro])
+int d4 = trendDir(f4[ro], s4[ro], c4[ro])
+
+int nBull = (d1 == 1 ? 1 : 0) + (d2 == 1 ? 1 : 0) + (d3 == 1 ? 1 : 0) + (d4 == 1 ? 1 : 0)
+int nBear = (d1 == -1 ? 1 : 0) + (d2 == -1 ? 1 : 0) + (d3 == -1 ? 1 : 0) + (d4 == -1 ? 1 : 0)
+int bias  = nBull >= biasNeed and nBull > nBear ? 1 : nBear >= biasNeed and nBear > nBull ? -1 : 0
+
+// 4H 策略方向：日線 EMA50 vs EMA200
+float dFast   = dF[ro]
+float dSlow   = dS[ro]
+bool  dReady  = not na(dFast) and not na(dSlow)
+int   stratDir = not dReady ? 0 : dFast > dSlow ? 1 : dFast < dSlow ? -1 : 0
+
+bgcolor(showBg and bias != 0 ? color.new(bias == 1 ? bullCol : bearCol, bgTransp) : na, title = "短線偏向背景")
+
+// ─────────────────────────── 支撐 / 壓力（沿用 support_resistance.pine） ───────────────────────────
+float atr = ta.atr(atrLen)
+float z   = nz(atr) * zoneMult / 2
+
+lvName(bool isRes, int touches) =>
+    string base = isRes ? resWord : "支撐"
+    touches >= strongTouch ? "強" + base : base
+
+const int MAX_LEVELS = 40
+var array<Level> levels = array.new<Level>()
+
+// 收盤價超出區間 → 角色互換：壓力被突破轉為支撐，支撐被跌破轉為壓力
+if not na(atr)
+    for lv in levels
+        if lv.isRes and close > lv.price + z
+            lv.isRes := false
+        else if not lv.isRes and close < lv.price - z
+            lv.isRes := true
+
+// 新的前高 / 前低：靠近既有價位就合併（觸碰 +1），否則新增
+addLevel(float p, int pBar) =>
+    int   idx  = -1
+    float best = atr * mergeMult
+    for [i, lv] in levels
+        float d = math.abs(lv.price - p)
+        if d <= best
+            best := d
+            idx  := i
+    if idx >= 0
+        Level hit = levels.get(idx)
+        hit.price   := (hit.price * hit.touches + p) / (hit.touches + 1)
+        hit.touches := hit.touches + 1
+        hit.lastBar := pBar
+    else
+        levels.push(Level.new(price = p, isRes = close < p, startBar = pBar, lastBar = pBar))
+        if levels.size() > MAX_LEVELS
+            int old = 0
+            for i = 1 to levels.size() - 1
+                if levels.get(i).lastBar < levels.get(old).lastBar
+                    old := i
+            levels.remove(old)
+    idx
+
+float ph = ta.pivothigh(high, pivotLen, pivotLen)
+float pl = ta.pivotlow(low, pivotLen, pivotLen)
+
+if not na(atr)
+    if not na(ph)
+        addLevel(ph, bar_index - pivotLen)
+    if not na(pl)
+        addLevel(pl, bar_index - pivotLen)
+
+var array<line>  lvLines  = array.new<line>()
+var array<box>   lvBoxes  = array.new<box>()
+var array<label> lvLabels = array.new<label>()
+
+drawLevel(Level lv, string lblSize) =>
+    bool   strong = lv.touches >= strongTouch
+    color  c      = lv.isRes ? resCol : supCol
+    int    x1     = math.max(lv.startBar, bar_index - 4900)
+    int    x2     = bar_index + lblOffset
+    string txt    = lvName(lv.isRes, lv.touches) + (showPrice ? "  " + fmt(lv.price) : "")
+    string tip    = "觸碰次數：" + str.tostring(lv.touches) + "\n區間：" + fmt(lv.price - z) + " ~ " + fmt(lv.price + z)
+    lvLines.push(line.new(x1, lv.price, x2, lv.price, color = c, width = strong ? 3 : 2, style = strong ? line.style_solid : line.style_dashed))
+    if showZone and z > 0
+        lvBoxes.push(box.new(x1, lv.price + z, x2, lv.price - z, border_color = color.new(c, 100), border_width = 0, bgcolor = color.new(c, strong ? 75 : 88)))
+    lvLabels.push(label.new(x2, lv.price, txt, color = strong ? c : color.new(c, 20), style = label.style_label_left, textcolor = color.white, size = lblSize, tooltip = tip, text_formatting = text.format_bold))
+    strong
+
+// 只在最後一根K棒重畫：上下各取離現價最近的 N 條
+if barstate.islast
+    for l in lvLines
+        l.delete()
+    for b in lvBoxes
+        b.delete()
+    for lb in lvLabels
+        lb.delete()
+    lvLines.clear()
+    lvBoxes.clear()
+    lvLabels.clear()
+
+    if showLv
+        string       lvSize = toSize(lvSizeIn)
+        array<Level> sups   = array.new<Level>()
+        array<float> supD   = array.new<float>()
+        array<Level> ress   = array.new<Level>()
+        array<float> resD   = array.new<float>()
+        for lv in levels
+            float d = math.abs(close - lv.price)
+            if lv.isRes
+                ress.push(lv)
+                resD.push(d)
+            else
+                sups.push(lv)
+                supD.push(d)
+        if sups.size() > 0
+            array<int> near = supD.sort_indices(order.ascending)
+            for k = 0 to math.min(perSide, sups.size()) - 1
+                drawLevel(sups.get(near.get(k)), lvSize)
+        if ress.size() > 0
+            array<int> near = resD.sort_indices(order.ascending)
+            for k = 0 to math.min(perSide, ress.size()) - 1
+                drawLevel(ress.get(near.get(k)), lvSize)
+
+// ─────────────────────────── 當日參考價位 ───────────────────────────
+// 把時間往前移「換日時間」，再取該時區的日期 → 每天在設定的時間換日（預設 UTC+8 08:00）
+int  tShift = time - (dayHour * 60 + dayMin) * 60000
+int  dayKey = year(tShift, dayTz) * 10000 + month(tShift, dayTz) * 100 + dayofmonth(tShift, dayTz)
+bool newDay = bar_index == 0 or dayKey != dayKey[1]
+
+var float dayOpen  = na
+var float dayHigh  = na
+var float dayLow   = na
+var float prevHigh = na
+var float prevLow  = na
+var bool  fullDay  = false   // 目前這一天是否從換日時間開始（圖表最前面不完整的一天不算）
+
+if newDay
+    if fullDay
+        prevHigh := dayHigh
+        prevLow  := dayLow
+    fullDay := bar_index > 0
+    dayOpen := open
+    dayHigh := high
+    dayLow  := low
+else
+    dayHigh := math.max(dayHigh, high)
+    dayLow  := math.min(dayLow, low)
+
+float vwapV = ta.vwap(vwapSrc, newDay)
+
+// 換日那根K棒線段不上色，避免前後兩天的價位連成一條斜線
+plot(showVwap ? vwapV : na, "當日 VWAP", color = newDay ? color(na) : vwapCol, linewidth = 2)
+plot(showOpen and fullDay ? dayOpen : na, "今日開盤價", color = newDay ? color(na) : openCol, linewidth = 1)
+plot(showPdhl ? prevHigh : na, "前一日高點", color = newDay ? color(na) : pdhCol, linewidth = 1)
+plot(showPdhl ? prevLow : na, "前一日低點", color = newDay ? color(na) : pdlCol, linewidth = 1)
+
+var array<label> refLabels = array.new<label>()
+
+addRef(bool show, float p, string name, color c) =>
+    bool ok = show and not na(p)
+    if ok
+        refLabels.push(label.new(bar_index + refOffset, p, name + (showPrice ? "  " + fmt(p) : ""), color = color.new(c, 20), style = label.style_label_left, textcolor = color.white, size = toSize(lvSizeIn)))
+    ok
+
+if barstate.islast
+    for lb in refLabels
+        lb.delete()
+    refLabels.clear()
+    addRef(showVwap, vwapV, "VWAP", vwapCol)
+    addRef(showOpen and fullDay, dayOpen, "今日開盤", openCol)
+    addRef(showPdhl, prevHigh, "前日高", pdhCol)
+    addRef(showPdhl, prevLow, "前日低", pdlCol)
+
+// 各週期多空顯示在資料視窗（1 = 多、-1 = 空、0 = 盤整）
+plot(d1, "週期 1 趨勢", display = display.data_window)
+plot(d2, "週期 2 趨勢", display = display.data_window)
+plot(d3, "週期 3 趨勢", display = display.data_window)
+plot(d4, "週期 4 趨勢", display = display.data_window)
+plot(bias, "短線偏向", display = display.data_window)
+
+// ─────────────────────────── 右上角表格 ───────────────────────────
+var table tb = table.new(toPos(tblPosIn), 2, 7, bgcolor = color.new(#131722, 15), frame_color = color.new(#787b86, 40), frame_width = 1, border_color = color.new(#787b86, 75), border_width = 1)
+
+setRow(int r, string k, string v, color c, string tip) =>
+    string sz = toSize(tblSizeIn)
+    tb.cell(0, r, k, text_color = color.white, text_halign = text.align_left, text_size = sz)
+    tb.cell(1, r, v, text_color = c, text_halign = text.align_left, text_size = sz, tooltip = tip)
+
+trendTip(float ef, float es, float c) =>
+    na(ef) or na(es) or na(c) ? "高週期歷史不足，算不出 EMA" : "收盤 " + fmt(c) + "\nEMA" + str.tostring(fastLen) + " " + fmt(ef) + "\nEMA" + str.tostring(slowLen) + " " + fmt(es)
+
+setTrendRow(int r, string tf, int d, float ef, float es, float c) =>
+    setRow(r, tfName(tf), trendText(d), dirColor(d), trendTip(ef, es, c))
+
+if barstate.islast
+    setRow(0, "5分看盤輔助", syminfo.ticker + " · " + tfName(timeframe.period), color.white, "")
+    setTrendRow(1, tf1, d1, f1[ro], s1[ro], c1[ro])
+    setTrendRow(2, tf2, d2, f2[ro], s2[ro], c2[ro])
+    setTrendRow(3, tf3, d3, f3[ro], s3[ro], c3[ro])
+    setTrendRow(4, tf4, d4, f4[ro], s4[ro], c4[ro])
+    string biasTxt = bias == 1 ? "偏多" : bias == -1 ? "偏空" : "方向不一致，觀望"
+    string cntTip  = "多 " + str.tostring(nBull) + " / 空 " + str.tostring(nBear) + " / 其他 " + str.tostring(4 - nBull - nBear) + "（需 " + str.tostring(biasNeed) + " 個同方向）"
+    setRow(5, "短線偏向", biasTxt + "（多 " + str.tostring(nBull) + " / 空 " + str.tostring(nBear) + "）", dirColor(bias), cntTip)
+    string sTxt = not dReady ? "資料不足" : stratDir == 1 ? "只做多" : stratDir == -1 ? "只做空" : "持平"
+    string sTip = not dReady ? "日線歷史不足，算不出 EMA" + str.tostring(dSlowLen) : tfName(tfD) + " EMA" + str.tostring(dFastLen) + " " + fmt(dFast) + "\n" + tfName(tfD) + " EMA" + str.tostring(dSlowLen) + " " + fmt(dSlow)
+    setRow(6, "4H 策略方向", sTxt, dirColor(stratDir), sTip)
